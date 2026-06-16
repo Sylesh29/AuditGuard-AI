@@ -1,0 +1,558 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AuditGuard AI — Manufacturing Compliance</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link href="styles.css" rel="stylesheet" />
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const API = 'http://localhost:8000';
+
+    /* ─────────────── SVG ICONS ─────────────── */
+    const IconSearch = () => (
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+      </svg>
+    );
+    const IconChart = () => (
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/>
+      </svg>
+    );
+    const IconWrench = () => (
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+      </svg>
+    );
+    const IconDoc = () => (
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14,2 14,8 20,8"/>
+        <line x1="16" y1="13" x2="8" y2="13"/>
+        <line x1="16" y1="17" x2="8" y2="17"/>
+        <line x1="10" y1="9" x2="8" y2="9"/>
+      </svg>
+    );
+    const IconCheck = () => (
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+        <polyline points="20 6 9 17 4 12"/>
+      </svg>
+    );
+
+    const AGENTS = [
+      { key: 'scout',   label: 'Scout',    desc: 'Finds all issues',    Icon: IconSearch },
+      { key: 'ranker',  label: 'Ranker',   desc: 'Ranks by risk',       Icon: IconChart  },
+      { key: 'fixer',   label: 'Fixer',    desc: 'Auto-corrects',       Icon: IconWrench },
+      { key: 'narrator',label: 'Narrator', desc: 'Writes narrative',    Icon: IconDoc    },
+    ];
+
+    /* ─────────────── HELPERS ─────────────── */
+    function actionVariant(action) {
+      if (!action || action === 'No action') return 'none';
+      const a = action.toLowerCase();
+      if (a.includes('removed') || a.includes('requires_manual')) return 'fixed';
+      if (a.includes('flagged') || a.includes('flag')) return 'flagged';
+      if (a.includes('escalat')) return 'escalated';
+      return 'none';
+    }
+    function actionLabel(action) {
+      if (!action || action === 'No action') return 'No action';
+      const a = action.toLowerCase();
+      if (a.includes('removed')) return 'Auto-fixed';
+      if (a.includes('requires_manual')) return 'Flagged';
+      if (a.includes('flagged')) return 'Flagged';
+      if (a.includes('escalat')) return 'Escalated';
+      return action.length > 18 ? action.slice(0, 18) + '…' : action;
+    }
+    function ts() {
+      return new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    /* ─────────────── UPLOAD ZONE ─────────────── */
+    function UploadZone({ onUpload, disabled }) {
+      const [drag, setDrag] = React.useState(false);
+      const [file, setFile] = React.useState(null);
+
+      const handle = (f) => {
+        if (!f) return;
+        if (!f.name.endsWith('.csv')) { alert('Please upload a CSV file.'); return; }
+        setFile(f.name);
+        onUpload(f);
+      };
+
+      return (
+        <div
+          className={`upload-zone${drag ? ' drag' : ''}${disabled ? ' disabled' : ''}${file ? ' has-file' : ''}`}
+          onDrop={e => { e.preventDefault(); setDrag(false); if (!disabled) handle(e.dataTransfer.files[0]); }}
+          onDragOver={e => { e.preventDefault(); if (!disabled) setDrag(true); }}
+          onDragLeave={() => setDrag(false)}
+        >
+          <input type="file" className="upload-file-input" accept=".csv"
+            onChange={e => handle(e.target.files[0])} disabled={disabled} />
+
+          <div className="upload-icon-ring">
+            {file ? '✓' : '↑'}
+          </div>
+
+          {file ? (
+            <>
+              <div className="upload-h">Dataset ready for audit</div>
+              <div className="upload-sub" style={{marginBottom: 14}}>Four agents are queued and ready to run</div>
+              <div className="file-chip">📄 {file}</div>
+            </>
+          ) : (
+            <>
+              <div className="upload-h">Drop your manufacturing CSV</div>
+              <div className="upload-sub">Or click anywhere to browse files · Any column structure accepted</div>
+              <div className="upload-pills">
+                <span className="upload-pill">🔍 Scout detects issues</span>
+                <span className="upload-pill">⚡ Ranker prioritizes risk</span>
+                <span className="upload-pill">🔧 Fixer auto-corrects</span>
+                <span className="upload-pill">📄 Narrator writes PDF</span>
+              </div>
+            </>
+          )}
+        </div>
+      );
+    }
+
+    /* ─────────────── PIPELINE ─────────────── */
+    function Pipeline({ statuses, summaries }) {
+      const allDone = AGENTS.every(a => statuses[a.key] === 'complete');
+
+      const connState = (aKey, bKey) => {
+        const sa = statuses[aKey], sb = statuses[bKey];
+        if (sa === 'complete' && sb === 'complete') return 'done';
+        if (sa === 'complete' && sb === 'running') return 'flowing';
+        return 'idle';
+      };
+
+      return (
+        <div className="pipeline-card section">
+          <div className="pipeline-track">
+            {AGENTS.map((ag, idx) => {
+              const st = statuses[ag.key];
+              const sum = summaries[ag.key];
+              return (
+                <React.Fragment key={ag.key}>
+                  <div className="p-node-wrap">
+                    <div className={`p-node ${st}`}>
+                      {st === 'complete' ? <IconCheck /> : <ag.Icon />}
+                      <span className="p-step-badge">{idx + 1}</span>
+                    </div>
+                    <div className="p-label">
+                      <span className="p-name">{ag.label}</span>
+                      <span className="p-desc">{ag.desc}</span>
+                      <span className={`p-status-tag ${st}`}>
+                        {st === 'idle' ? 'Waiting' : st === 'running' ? 'Working…' : st === 'complete' ? 'Done ✓' : 'Error'}
+                      </span>
+                      {sum && (
+                        <div className="p-stats">
+                          {Object.entries(sum).map(([k, v]) => `${v} ${k}`).join(' · ')}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  {idx < AGENTS.length - 1 && (
+                    <div className="p-connector">
+                      <div className={`p-line ${connState(ag.key, AGENTS[idx + 1].key)}`} />
+                    </div>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </div>
+
+          {allDone && (
+            <div className="pipeline-footer">
+              <span className="footer-dot" />
+              All 4 agents completed · Results written to Cognee memory · Audit narrative PDF ready for download
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ─────────────── LIVE LOG ─────────────── */
+    function LiveLog({ logs, running }) {
+      const endRef = React.useRef(null);
+      React.useEffect(() => {
+        endRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, [logs]);
+
+      return (
+        <div className="log-panel section">
+          <div className="log-header">AuditGuard AI · Live Pipeline Output</div>
+          {logs.map((l, i) => (
+            <div className="log-row" key={i}>
+              <span className="log-ts">{l.ts}</span>
+              <span className={`log-src ${l.agent}`}>[{l.agent.toUpperCase()}]</span>
+              <span className="log-text">{l.msg}</span>
+            </div>
+          ))}
+          {running && (
+            <div className="log-row">
+              <span className="log-ts">—</span>
+              <span className="log-src system">[SYS]</span>
+              <span className="log-text">Processing<span className="log-cursor" /></span>
+            </div>
+          )}
+          <div ref={endRef} />
+        </div>
+      );
+    }
+
+    /* ─────────────── STATS ─────────────── */
+    function StatsRow({ stats }) {
+      const cards = [
+        { k: 'HIGH',       label: 'Critical',   cls: 's-crit',  ico: '🚨' },
+        { k: 'MED',        label: 'Moderate',   cls: 's-mod',   ico: '⚠️' },
+        { k: 'LOW',        label: 'Minor',      cls: 's-low',   ico: '📋' },
+        { k: 'auto_fixed', label: 'Auto-Fixed', cls: 's-fixed', ico: '✅' },
+        { k: 'escalated',  label: 'Need Review',cls: 's-escal', ico: '🔴' },
+      ];
+      return (
+        <div className="stats-grid">
+          {cards.map(({ k, label, cls, ico }, i) => (
+            <div key={k} className={`stat-card ${cls}`} style={{ animationDelay: `${i * 70}ms` }}>
+              <div className="stat-ico">{ico}</div>
+              <div className="stat-num">{stats[k] ?? 0}</div>
+              <div className="stat-lbl">{label}</div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    /* ─────────────── FINDING CARD ─────────────── */
+    function FindingCard({ f, delay }) {
+      const [open, setOpen] = React.useState(false);
+      const variant = actionVariant(f.action_taken);
+      const label   = actionLabel(f.action_taken);
+
+      return (
+        <div className={`f-card${open ? ' open' : ''}`} style={{ animationDelay: `${delay}ms` }}>
+          <div className="f-bar">
+            <div className={`f-strip ${f.severity}`} />
+            <div className="f-main" onClick={() => setOpen(!open)}>
+              {/* Rank */}
+              <div className="f-rank-col">
+                <span className="f-rank-num">#{f.rank}</span>
+                <span className="f-rank-lbl">rank</span>
+              </div>
+              {/* Body */}
+              <div className="f-body-col">
+                <div className="f-meta">
+                  <span className="f-type">{f.issue_type}</span>
+                  <span className="f-id">{f.finding_id}</span>
+                  <span className={`sev-pill ${f.severity}`}>
+                    {f.severity === 'MED' ? 'Moderate' : f.severity === 'HIGH' ? 'Critical' : 'Low'}
+                  </span>
+                </div>
+                <div className="f-preview">{f.ranking_reason}</div>
+              </div>
+              {/* Action + chevron */}
+              <div className="f-right">
+                <span className={`act-badge ${variant}`}>{label}</span>
+                <span className="f-rows">{f.rows_affected} row{f.rows_affected !== 1 ? 's' : ''}</span>
+                <span className="f-chevron">▼</span>
+              </div>
+            </div>
+          </div>
+
+          {open && (
+            <div className="f-expand">
+              <div className="f-expand-grid">
+                <div className="f-expand-block">
+                  <div className="f-expand-lbl">Full ranking reason</div>
+                  <div className="f-expand-val">{f.ranking_reason}</div>
+                </div>
+                <div className="f-expand-block">
+                  <div className="f-expand-lbl">Action taken</div>
+                  <div className="f-expand-val">{f.action_taken || 'No action taken'}</div>
+                  {f.claude_note && (
+                    <>
+                      <div className="f-expand-lbl" style={{marginTop: 10}}>AuditGuard AI regulatory note</div>
+                      <div className="f-expand-val ai-note">{f.claude_note}</div>
+                    </>
+                  )}
+                  {f.lot_numbers?.length > 0 && (
+                    <>
+                      <div className="f-expand-lbl" style={{marginTop: 10}}>Lot numbers</div>
+                      <div className="f-lots">{f.lot_numbers.join(', ')}</div>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ─────────────── FINDINGS SECTION ─────────────── */
+    function FindingsSection({ findings }) {
+      const [filter, setFilter] = React.useState('ALL');
+
+      const counts = {
+        ALL:  findings.length,
+        HIGH: findings.filter(f => f.severity === 'HIGH').length,
+        MED:  findings.filter(f => f.severity === 'MED').length,
+        LOW:  findings.filter(f => f.severity === 'LOW').length,
+      };
+
+      const visible = filter === 'ALL' ? findings : findings.filter(f => f.severity === filter);
+
+      const tabs = [
+        { k: 'ALL',  label: 'All',      cls: 't-all'  },
+        { k: 'HIGH', label: 'Critical', cls: 't-high' },
+        { k: 'MED',  label: 'Moderate', cls: 't-med'  },
+        { k: 'LOW',  label: 'Low',      cls: 't-low'  },
+      ];
+
+      return (
+        <div className="section">
+          <div className="findings-hd">
+            <div>
+              <span className="findings-title">Findings</span>
+              {'  '}
+              <span className="findings-sub">sorted by audit risk · click any row to expand</span>
+            </div>
+            <div className="filter-bar">
+              {tabs.map(({ k, label, cls }) => (
+                <button
+                  key={k}
+                  className={`f-tab ${cls}${filter === k ? ' on' : ''}`}
+                  onClick={() => setFilter(k)}
+                >
+                  {label}
+                  <span className="f-count">{counts[k]}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="findings-list">
+            {visible.map((f, i) => (
+              <FindingCard key={f.finding_id} f={f} delay={i * 40} />
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    /* ─────────────── DOWNLOAD BANNER ─────────────── */
+    function DownloadBanner({ onDownload }) {
+      return (
+        <div className="download-banner section">
+          <div className="dl-ready-pill">● Audit narrative ready</div>
+          <div className="dl-title">Your Report is Ready to Sign</div>
+          <div className="dl-sub">
+            Plain-English summary of every finding, correction, and open item —
+            formatted for your auditor with a certification block and signature lines.
+          </div>
+          <button className="dl-btn" onClick={onDownload}>
+            <span>↓</span> Download Audit Narrative PDF
+          </button>
+          <div className="dl-meta">
+            Includes reference ID · Certification block · Signature lines · Every decision traceable
+          </div>
+        </div>
+      );
+    }
+
+    /* ─────────────── APP ─────────────── */
+    function App() {
+      const [statuses, setStatuses]     = React.useState({ scout:'idle', ranker:'idle', fixer:'idle', narrator:'idle' });
+      const [summaries, setSummaries]   = React.useState({});
+      const [findings, setFindings]     = React.useState([]);
+      const [stats, setStats]           = React.useState(null);
+      const [phase, setPhase]           = React.useState('idle'); // idle | running | complete | error
+      const [pdfReady, setPdfReady]     = React.useState(false);
+      const [error, setError]           = React.useState(null);
+      const [logs, setLogs]             = React.useState([]);
+      const [connected, setConnected]   = React.useState(false);
+
+      React.useEffect(() => {
+        fetch(`${API}/health`).then(() => setConnected(true)).catch(() => setConnected(false));
+      }, []);
+
+      const log = (agent, msg) => setLogs(prev => [...prev, { ts: ts(), agent, msg }]);
+
+      async function handleUpload(file) {
+        setPhase('running');
+        setPdfReady(false);
+        setFindings([]);
+        setStats(null);
+        setError(null);
+        setLogs([]);
+        setStatuses({ scout:'idle', ranker:'idle', fixer:'idle', narrator:'idle' });
+        setSummaries({});
+
+        log('system', `Uploading ${file.name} (${(file.size / 1024).toFixed(1)} KB)`);
+
+        const fd = new FormData();
+        fd.append('file', file);
+
+        try {
+          const res = await fetch(`${API}/run-audit`, { method:'POST', body:fd });
+          if (!res.ok) throw new Error(`Server error: ${res.status}`);
+
+          const reader = res.body.getReader();
+          const dec    = new TextDecoder();
+          let buf = '';
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const lines = buf.split('\n');
+            buf = lines.pop();
+
+            for (const line of lines) {
+              const t = line.trim();
+              if (!t.startsWith('data:')) continue;
+              const js = t.slice(5).trim();
+              if (!js) continue;
+              try {
+                const ev = JSON.parse(js);
+
+                if (ev.agent === 'pipeline' && ev.status === 'complete') {
+                  setPhase('complete');
+                  setPdfReady(true);
+                  log('system', 'Pipeline complete — fetching results…');
+                  const r    = await fetch(`${API}/findings`);
+                  const data = await r.json();
+                  setFindings(data.findings || []);
+                  setStats(data.stats || null);
+                  const n = data.findings?.length || 0;
+                  log('system', `${n} findings loaded · PDF ready for download`);
+
+                } else if (ev.agent === 'pipeline' && ev.status === 'error') {
+                  setPhase('error');
+                  setError(ev.message || 'Pipeline error');
+
+                } else if (ev.agent) {
+                  setStatuses(p => ({ ...p, [ev.agent]: ev.status }));
+                  if (ev.status === 'running') {
+                    const msgs = {
+                      scout:    'Scanning dataset · detecting duplicates, conflicts, outliers and contradictions…',
+                      ranker:   'Applying deterministic priority rules · requesting Claude regulatory review…',
+                      fixer:    'Auto-fixing duplicates · flagging conflicts · escalating critical issues…',
+                      narrator: 'Generating plain-English audit narrative with Claude Sonnet…',
+                    };
+                    log(ev.agent, msgs[ev.agent] || 'Working…');
+                  }
+                  if (ev.status === 'complete' && ev.summary) {
+                    setSummaries(p => ({ ...p, [ev.agent]: ev.summary }));
+                    const s = Object.entries(ev.summary).map(([k,v]) => `${v} ${k}`).join(', ');
+                    log(ev.agent, `Done — ${s}`);
+                  }
+                  if (ev.status === 'error') {
+                    setError(`${ev.agent}: ${ev.message}`);
+                    log(ev.agent, `ERROR — ${ev.message}`);
+                  }
+                }
+              } catch (_) {}
+            }
+          }
+        } catch (e) {
+          setPhase('error');
+          setError(e.message);
+          log('system', `Error: ${e.message}`);
+        }
+      }
+
+      return (
+        <div className="app-shell">
+          {/* HEADER */}
+          <header className="header">
+            <div className="header-brand">
+              <div className="brand-shield">🛡️</div>
+              <div>
+                <div className="brand-name">AuditGuard AI</div>
+                <div className="brand-sub">Manufacturing Compliance · M-AGENTS Hackathon</div>
+              </div>
+            </div>
+            <div className="header-right">
+              <div className="conn-pill">
+                <span className={`conn-dot${connected ? '' : ' off'}`} />
+                {connected ? 'API connected' : 'API offline'}
+              </div>
+              <div className="header-badge">FDA Audit Mode</div>
+            </div>
+          </header>
+
+          <main>
+            <div className="page-content">
+
+              {/* INTRO — only when idle */}
+              {phase === 'idle' && (
+                <div className="intro">
+                  <div className="intro-eyebrow">Track 01 — Data Rescue · M-AGENTS Hackathon · June 7, 2026</div>
+                  <div className="intro-h">Audit-Ready in Minutes,<br/>Not Days</div>
+                  <div className="intro-p">
+                    Upload your manufacturing CSV. Four AI agents will scan every row,
+                    rank issues by regulatory risk, fix what they can automatically,
+                    and hand you a signed-ready narrative PDF — no engineer required.
+                  </div>
+                </div>
+              )}
+
+              {/* UPLOAD */}
+              <UploadZone onUpload={handleUpload} disabled={phase === 'running'} />
+
+              {/* ERROR */}
+              {error && <div className="err-bar">⚠ {error}</div>}
+
+              {/* PIPELINE */}
+              {phase !== 'idle' && (
+                <Pipeline statuses={statuses} summaries={summaries} />
+              )}
+
+              {/* LIVE LOG */}
+              {logs.length > 0 && (
+                <LiveLog logs={logs} running={phase === 'running'} />
+              )}
+
+              {/* STATS */}
+              {phase === 'complete' && stats && (
+                <div className="section">
+                  <div className="section-hd">
+                    <span className="section-hd-title">Audit Summary</span>
+                    <div className="section-rule" />
+                  </div>
+                  <StatsRow stats={stats} />
+                </div>
+              )}
+
+              {/* FINDINGS */}
+              {findings.length > 0 && (
+                <FindingsSection findings={findings} />
+              )}
+
+              {/* DOWNLOAD */}
+              {pdfReady && (
+                <DownloadBanner onDownload={() => window.open(`${API}/download-narrative`, '_blank')} />
+              )}
+
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
