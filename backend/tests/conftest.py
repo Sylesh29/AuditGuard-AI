@@ -36,6 +36,7 @@ class FakeLLM:
     """Stands in for AnthropicLLM. Returns canned objects keyed by schema name."""
 
     model = "fake-model"
+    provider = "fake"
 
     def __init__(self, responses: dict | None = None, enabled: bool = True) -> None:
         self.responses = responses or {}
