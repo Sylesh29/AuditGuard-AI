@@ -13,7 +13,13 @@ known-first-party = ["agents", "utils", "ingest", "llm", "main", "models", "pipe
 [tool.pytest.ini_options]
 testpaths = ["backend/tests"]
 pythonpath = ["backend", "backend/tests"]
-filterwarnings = ["error"]
+# Fail on warnings our own code triggers (e.g. pandas FutureWarning), but not on deprecation
+# notices that dependencies emit about each other: those vary with installed versions.
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
 markers = ["slow: large-dataset performance tests"]
 
 [tool.ruff.lint.flake8-bugbear]
