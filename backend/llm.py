@@ -9,6 +9,7 @@ import logging
 from typing import Protocol, TypeVar
 
 import anthropic
+import pydantic
 from pydantic import BaseModel
 
 from settings import Settings
@@ -27,7 +28,8 @@ class StructuredLLM(Protocol):
 
 
 class AnthropicLLM:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, http_client: anthropic.DefaultAsyncHttpxClient | None = None
+                 ) -> None:
         self.model = settings.llm_model
         self.enabled = settings.llm_enabled
         self._client = (
@@ -35,6 +37,7 @@ class AnthropicLLM:
                 api_key=settings.anthropic_api_key,
                 timeout=settings.llm_timeout_s,
                 max_retries=settings.llm_max_retries,
+                http_client=http_client,
             )
             if self.enabled
             else None
@@ -59,6 +62,11 @@ class AnthropicLLM:
             return None
         except anthropic.APIConnectionError:
             logger.warning("LLM unreachable; using deterministic fallback")
+            return None
+        except pydantic.ValidationError:
+            # The SDK validates structured output eagerly; truncated (max_tokens) or refused
+            # output fails here. That must degrade the prose, never fail the audit.
+            logger.warning("LLM output did not match the %s schema; using fallback", schema.__name__)
             return None
         if response.stop_reason != "end_turn" or response.parsed_output is None:
             logger.warning("LLM returned no usable output (stop_reason=%s)", response.stop_reason)

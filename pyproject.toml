@@ -13,6 +13,8 @@ known-first-party = ["agents", "utils", "ingest", "llm", "main", "models", "pipe
 [tool.pytest.ini_options]
 testpaths = ["backend/tests"]
 pythonpath = ["backend", "backend/tests"]
+filterwarnings = ["error"]
+markers = ["slow: large-dataset performance tests"]
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = ["fastapi.File"]

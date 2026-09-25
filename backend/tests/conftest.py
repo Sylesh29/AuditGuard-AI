@@ -1,17 +1,29 @@
 from __future__ import annotations
 
-import io
+import os
 import sys
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import pytest
+from hypothesis import HealthCheck
+from hypothesis import settings as hypothesis_settings
 
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
-from settings import DEFAULT_SPEC_PATH, SpecLimits  # noqa: E402
+from ingest import load_csv  # noqa: E402
+from settings import DEFAULT_SPEC_PATH, Settings, SpecLimits  # noqa: E402
+
+# HYPOTHESIS_PROFILE=thorough runs thousands of generated datasets instead of the CI default.
+_slow_ok = [HealthCheck.too_slow, HealthCheck.data_too_large]
+hypothesis_settings.register_profile("ci", max_examples=150, deadline=None,
+                                     suppress_health_check=_slow_ok)
+hypothesis_settings.register_profile("thorough", max_examples=3000, deadline=None,
+                                     suppress_health_check=_slow_ok)
+hypothesis_settings.load_profile(os.getenv("HYPOTHESIS_PROFILE", "ci"))
 
 SAMPLE_CSV = BACKEND.parent / "data" / "sample.csv"
 TODAY = date(2026, 9, 25)
@@ -36,8 +48,9 @@ class FakeLLM:
 
 
 def frame(rows: list[str], header: str = HEADER) -> pd.DataFrame:
+    """Parse rows exactly the way an upload is parsed."""
     text = "\n".join([header, *rows]) + "\n"
-    return pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, na_values=[""])
+    return load_csv(text.encode(), "test.csv", 1_000_000).frame
 
 
 def normal_rows(n: int, product: str = "PROD-A", start: int = 1) -> list[str]:
@@ -46,7 +59,7 @@ def normal_rows(n: int, product: str = "PROD-A", start: int = 1) -> list[str]:
     for i in range(n):
         temp = 70 + (i % 5) * 0.5
         pressure = 4.0 + (i % 3) * 0.1
-        rows.append(f"LOT{start + i:04d},{product},2026-01-{(i % 28) + 1:02d},{100 + i},kg,"
+        rows.append(f"LOT{start + i:05d},{product},2026-01-{(i % 28) + 1:02d},{100 + i},kg,"
                     f"{temp},{pressure:.1f},INSP-01,FAC-01,PASS,ok")
     return rows
 
@@ -58,5 +71,18 @@ def spec() -> SpecLimits:
 
 @pytest.fixture
 def sample_df() -> pd.DataFrame:
-    return pd.read_csv(SAMPLE_CSV, dtype=str, keep_default_na=False, na_values=[""],
-                       encoding="utf-8-sig")
+    return load_csv(SAMPLE_CSV.read_bytes(), "sample.csv", 1_000_000).frame
+
+
+@pytest.fixture
+def settings() -> Settings:
+    return Settings(
+        anthropic_api_key=None, llm_enabled=False, llm_model="none", llm_timeout_s=5,
+        llm_max_retries=0, max_upload_bytes=1_000_000, max_rows=10_000, max_stored_runs=5,
+        run_ttl_s=3600, max_concurrent_runs=2, allowed_origins=[], spec_path=DEFAULT_SPEC_PATH,
+        frontend_dir=None,
+    )
+
+
+def with_settings(base: Settings, **changes) -> Settings:
+    return replace(base, **changes)

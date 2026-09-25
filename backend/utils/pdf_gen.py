@@ -77,7 +77,7 @@ def _footer(reference_id: str):
     return draw
 
 
-def _findings_table(report: Report, width: float) -> Table:
+def _findings_table(findings: list[dict], width: float) -> Table:
     widths = [0.45, 0.55, 1.15, 0.7, 0.5, 0.95]
     widths.append(width / inch - sum(widths))
     header = ["Rank", "ID", "Issue", "Severity", "Rows", "Action", "Why it matters"]
@@ -89,7 +89,7 @@ def _findings_table(report: Report, width: float) -> Table:
         ("TOPPADDING", (0, 0), (-1, -1), 4),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]
-    for i, f in enumerate(report.findings, start=1):
+    for i, f in enumerate(findings, start=1):
         rows.append([
             _p(f["rank"], "cell"), _p(f["finding_id"], "cell"), _p(f["issue"], "cell"),
             _p(SEVERITY_WORD[f["severity"]], "cell"), _p(f["rows"], "cell"),
@@ -123,6 +123,13 @@ def _signature_block(width: float) -> Table:
     return table
 
 
+PDF_MAX_FINDINGS = 1000  # beyond this, the table points to findings.csv (never silently)
+
+
+def _bullets(items: list[str]) -> list:
+    return [Paragraph(item, STYLES["bullet"], bulletText="•") for item in items] or [_p("None.")]
+
+
 def render_pdf(report: Report) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -143,41 +150,61 @@ def render_pdf(report: Report) -> bytes:
 
     story += _heading("Executive Summary")
     story.append(_p(report.executive_summary))
-    counts = (f"Findings: {s['total']} ({s['HIGH']} critical, {s['MED']} moderate, "
-              f"{s['LOW']} minor). Actions: {s['corrected']} corrections proposed, "
-              f"{s['escalated']} escalated, {s['flagged']} flagged. "
-              f"Change-log entries: {report.change_log_entries}.")
-    story.append(_p(counts))
+    story.append(_p(
+        f"Findings: {s['total']} ({s['HIGH']} critical, {s['MED']} moderate, {s['LOW']} minor). "
+        f"Actions: {s['corrected']} corrections proposed, {s['escalated']} escalated, "
+        f"{s['flagged']} flagged. Change-log entries: {report.change_log_entries}."))
 
     story += _heading(f"Findings and Actions ({len(report.findings)})")
-    if report.findings:
-        story.append(_findings_table(report, doc.width))
-    else:
+    if not report.findings:
         story.append(_p("No findings."))
+    else:
+        shown = report.findings[:PDF_MAX_FINDINGS]
+        story.append(_findings_table(shown, doc.width))
+        if len(report.findings) > len(shown):
+            story.append(_p(
+                f"This table shows the {len(shown)} highest-ranked of {len(report.findings)} "
+                "findings. All findings, with the same IDs and ranks, are listed in findings.csv, "
+                f"which is part of this report package ({report.reference_id}).", "small"))
 
     story += _heading(f"Open Items Requiring Human Sign-Off ({len(report.open_items)})")
-    for item in report.open_items:
-        story.append(Paragraph(
-            f"<b>{escape(item['finding_id'])}</b> ({escape(item['action'])}, lot "
-            f"{escape(', '.join(item['lots']))}, {escape(item['issue'])}): "
-            f"{escape(item['instruction'])}",
-            STYLES["bullet"], bulletText="•"))
-    if not report.open_items:
-        story.append(_p("None."))
+    story += _bullets([
+        f"<b>{escape(i['finding_id'])}</b> ({escape(i['action'])}, lot "
+        f"{escape(', '.join(i['lots']))}, {escape(i['issue'])}): {escape(i['instruction'])}"
+        for i in report.open_items[:PDF_MAX_FINDINGS]])
+    if len(report.open_items) > PDF_MAX_FINDINGS:
+        story.append(_p(f"{len(report.open_items) - PDF_MAX_FINDINGS} more open items are "
+                        "listed in findings.csv.", "small"))
 
     story += _heading(f"Proposed Corrections ({len(report.corrections)})")
-    for item in report.corrections:
-        story.append(Paragraph(
-            f"<b>{escape(item['finding_id'])}</b> (lot {escape(', '.join(item['lots']))}): "
-            f"{escape(item['description'])} {escape(item['reason'])}",
-            STYLES["bullet"], bulletText="•"))
-    if not report.corrections:
-        story.append(_p("None."))
+    story += _bullets([
+        f"<b>{escape(c['finding_id'])}</b> (lot {escape(', '.join(c['lots']))}): "
+        f"{escape(c['description'])} {escape(c['reason'])}"
+        for c in report.corrections[:PDF_MAX_FINDINGS]])
+    if len(report.corrections) > PDF_MAX_FINDINGS:
+        story.append(_p(f"{len(report.corrections) - PDF_MAX_FINDINGS} more corrections are "
+                        "listed in findings.csv and changelog.csv.", "small"))
     story.append(_p(
         "The uploaded source file was not modified. Each proposed change, with its original "
         "value, is listed in the change log (changelog.csv) issued with this report.", "small"))
 
-    story += _heading("Notes")
+    if report.review_suggestions:
+        story += _heading(f"Advisory Ranking Suggestions ({len(report.review_suggestions)})")
+        story.append(_p("A second-opinion review suggested these rank changes. The ranking above "
+                        "was not changed; consider them when prioritising work.", "small"))
+        story += _bullets([
+            f"<b>{escape(x['finding_id'])}</b>: rank {x['rank']} to {x['suggested_rank']}. "
+            f"{escape(x['reason'])}" for x in report.review_suggestions])
+
+    story += _heading("Scope and Configuration")
+    if report.skipped_checks:
+        story.append(_p("Checks that could not run on this file:"))
+        story += _bullets([escape(c) for c in report.skipped_checks])
+    if report.notes:
+        story.append(_p("About the uploaded file:"))
+        story += _bullets([escape(n) for n in report.notes])
+    story += [_labelled(k, v) for k, v in report.configuration.items()]
+    story.append(Spacer(1, 4))
     story.append(_p(report.disclaimer, "small"))
     if report.summary_source == "template":
         story.append(_p("The executive summary was generated from a fixed template.", "small"))

@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import secrets
+import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -28,6 +29,7 @@ class Run:
     created_at: datetime
     status: RunStatus = "running"
     error: str | None = None
+    finished_at: float | None = None  # monotonic clock, for retention
     stages: dict[str, StageStatus] = field(default_factory=lambda: dict.fromkeys(STAGES, "pending"))
     board: dict[str, Any] = field(default_factory=dict)       # stage outputs
     artifacts: dict[str, bytes] = field(default_factory=dict)  # downloadable files
@@ -53,7 +55,7 @@ class Run:
         await self.emit({"type": "stage", "stage": stage, "status": status, **extra})
 
     async def finish(self, status: RunStatus, error: str | None = None) -> None:
-        self.status, self.error = status, error
+        self.status, self.error, self.finished_at = status, error, time.monotonic()
         await self.emit({"type": "run", "status": status, "message": error})
 
     async def follow(self, after_id: int = 0, heartbeat_s: float = 15.0) -> AsyncIterator[dict | None]:
@@ -96,28 +98,35 @@ def sse_frame(event: dict | None) -> str:
 
 
 class RunStore:
-    """Bounded in-process store. Oldest finished runs are evicted first."""
+    """Bounded in-process store. Finished runs are deleted after `ttl_s` seconds (uploaded
+    data should not linger), and the oldest finished runs are evicted first when full."""
 
-    def __init__(self, max_runs: int) -> None:
+    def __init__(self, max_runs: int, ttl_s: float) -> None:
         self.max_runs = max_runs
+        self.ttl_s = ttl_s
         self._runs: OrderedDict[str, Run] = OrderedDict()
 
     def create(self, dataset_name: str, source_sha256: str) -> Run:
-        self._evict()
+        self._expire()
+        while len(self._runs) >= self.max_runs:
+            victim = next((rid for rid, r in self._runs.items() if r.finished), None)
+            if victim is None:
+                raise RuntimeError("too many audits in progress")
+            del self._runs[victim]
         run = Run(run_id=secrets.token_hex(16), dataset_name=dataset_name,
                   source_sha256=source_sha256, created_at=datetime.now(UTC))
         self._runs[run.run_id] = run
         return run
 
     def get(self, run_id: str) -> Run | None:
+        self._expire()
         return self._runs.get(run_id)
 
     def active(self) -> list[Run]:
         return [r for r in self._runs.values() if not r.finished]
 
-    def _evict(self) -> None:
-        while len(self._runs) >= self.max_runs:
-            victim = next((rid for rid, r in self._runs.items() if r.finished), None)
-            if victim is None:
-                raise RuntimeError("too many audits in progress")
-            del self._runs[victim]
+    def _expire(self) -> None:
+        cutoff = time.monotonic() - self.ttl_s
+        for run_id in [rid for rid, r in self._runs.items()
+                       if r.finished_at is not None and r.finished_at < cutoff]:
+            del self._runs[run_id]

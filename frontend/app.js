@@ -4,7 +4,10 @@
 
   const { useState, useEffect, useRef, Fragment } = React;
   const html = htm.bind(React.createElement);
-  const API = window.AUDITGUARD_API;
+  // Same origin by default. A split deployment can set window.AUDITGUARD_API in a same-origin
+  // script loaded before this one.
+  const API = (window.AUDITGUARD_API || '').replace(/\/$/, '');
+  const PAGE_SIZE = 50;
 
   /* ─────────────── ICONS ─────────────── */
   const svg = (children, strokeWidth = 2.5) => html`
@@ -45,12 +48,14 @@
   const SUMMARY_LABELS = {
     total: 'findings', HIGH: 'critical', MED: 'moderate', LOW: 'minor', rows_scanned: 'rows scanned',
     ranked: 'ranked', review: 'review', corrected: 'fixes proposed', flagged: 'flagged',
-    escalated: 'escalated', changes_logged: 'changes logged', findings_in_report: 'in report',
+    escalated: 'escalated', changes_logged: 'changes logged', in_report: 'in report',
     summary: 'summary',
   };
   const describe = (summary) => Object.entries(summary || {})
     .map(([k, v]) => (typeof v === 'number' ? `${v} ${SUMMARY_LABELS[k] || k}` : `${SUMMARY_LABELS[k] || k}: ${v}`))
     .join(' · ');
+
+  const summariseRows = (rows) => (rows.length > 12 ? `${rows.slice(0, 12).join(', ')} and ${rows.length - 12} more` : rows.join(', '));
 
   async function apiError(res) {
     try { return (await res.json()).detail || `HTTP ${res.status}`; }
@@ -58,13 +63,14 @@
   }
 
   /* ─────────────── UPLOAD ─────────────── */
-  function UploadZone({ onUpload, disabled }) {
+  function UploadZone({ onUpload, disabled, maxMb }) {
     const [drag, setDrag] = useState(false);
     const [file, setFile] = useState(null);
 
     const handle = (f) => {
       if (!f || disabled) return;
-      if (!f.name.toLowerCase().endsWith('.csv')) { alert('Please upload a CSV file.'); return; }
+      if (!/\.(csv|txt)$/i.test(f.name)) { onUpload(null, 'Please choose a .csv file (Excel: File > Save As > CSV UTF-8).'); return; }
+      if (maxMb && f.size > maxMb * 1024 * 1024) { onUpload(null, `The file is larger than the ${maxMb} MB limit.`); return; }
       setFile(f.name);
       onUpload(f);
     };
@@ -229,8 +235,8 @@
                   <div className="f-expand-val ai-note">
                     Suggests rank #${f.review_suggestion.suggested_rank}: ${f.review_suggestion.reason}
                   </div>`}
-                <div className="f-expand-lbl" style=${{ marginTop: 10 }}>Lots · CSV lines</div>
-                <div className="f-lots">${f.lot_numbers.join(', ')} · line ${f.csv_lines.join(', ')}</div>
+                <div className="f-expand-lbl" style=${{ marginTop: 10 }}>Lots · spreadsheet rows</div>
+                <div className="f-lots">${f.lot_numbers.join(', ')} · row ${summariseRows(f.spreadsheet_rows)}</div>
               </div>
             </div>
           </div>`}
@@ -239,6 +245,11 @@
 
   function FindingsSection({ findings }) {
     const [filter, setFilter] = useState('ALL');
+    const [query, setQuery] = useState('');
+    const [shown, setShown] = useState(PAGE_SIZE);
+    const choose = (k) => { setFilter(k); setShown(PAGE_SIZE); };
+    const search = (q) => { setQuery(q); setShown(PAGE_SIZE); };
+
     const tabs = [
       { k: 'ALL', label: 'All', cls: 't-all' },
       { k: 'HIGH', label: 'Critical', cls: 't-high' },
@@ -246,7 +257,11 @@
       { k: 'LOW', label: 'Minor', cls: 't-low' },
     ];
     const count = (k) => (k === 'ALL' ? findings.length : findings.filter((f) => f.severity === k).length);
-    const visible = filter === 'ALL' ? findings : findings.filter((f) => f.severity === filter);
+    const needle = query.trim().toLowerCase();
+    const visible = findings.filter((f) => (filter === 'ALL' || f.severity === filter) && (!needle
+      || f.finding_id.toLowerCase().includes(needle)
+      || f.issue_label.toLowerCase().includes(needle)
+      || f.lot_numbers.some((lot) => lot.toLowerCase().includes(needle))));
 
     return html`
       <div className="section">
@@ -258,14 +273,34 @@
           <div className="filter-bar" role="tablist">
             ${tabs.map(({ k, label, cls }) => html`
               <button key=${k} role="tab" aria-selected=${filter === k}
-                className=${`f-tab ${cls}${filter === k ? ' on' : ''}`} onClick=${() => setFilter(k)}>
+                className=${`f-tab ${cls}${filter === k ? ' on' : ''}`} onClick=${() => choose(k)}>
                 ${label}<span className="f-count">${count(k)}</span>
               </button>`)}
           </div>
         </div>
+        <input className="f-search" type="search" placeholder="Search by lot number, finding ID or issue"
+          aria-label="Search findings" value=${query} onChange=${(e) => search(e.target.value)} />
         <div className="findings-list">
-          ${visible.map((f, i) => html`<${FindingCard} key=${f.finding_id} f=${f} delay=${Math.min(i, 20) * 40} />`)}
+          ${visible.slice(0, shown).map((f, i) => html`
+            <${FindingCard} key=${f.finding_id} f=${f} delay=${Math.min(i, 20) * 40} />`)}
+          ${visible.length === 0 && html`<div className="f-empty">No findings match.</div>`}
         </div>
+        ${visible.length > shown && html`
+          <button className="f-more" onClick=${() => setShown(shown + PAGE_SIZE * 4)}>
+            Show more (${visible.length - shown} remaining)
+          </button>`}
+      </div>`;
+  }
+
+  function SummaryPanel({ result }) {
+    const notes = [...result.notes, ...result.skipped_checks];
+    return html`
+      <div className="summary-panel section">
+        <div className="summary-lbl">Executive summary${result.summary_source === 'template' ? ' (template)' : ''}</div>
+        <p className="summary-text">${result.executive_summary}</p>
+        ${notes.length > 0 && html`
+          <div className="summary-lbl">Scope notes</div>
+          <ul className="summary-notes">${notes.map((n) => html`<li key=${n}>${n}</li>`)}</ul>`}
       </div>`;
   }
 
@@ -282,6 +317,7 @@
         </div>
         <div className="dl-actions">
           <a className="dl-btn" href=${href('report.pdf')} download><span>↓</span> Audit report (PDF)</a>
+          <a className="dl-btn secondary" href=${href('findings.csv')} download>All findings (CSV)</a>
           <a className="dl-btn secondary" href=${href('corrected.csv')} download>Proposed corrected data (CSV)</a>
           <a className="dl-btn secondary" href=${href('changelog.csv')} download>Change log (CSV)</a>
         </div>
@@ -327,6 +363,8 @@
         }
         if (ev.status === 'error') log(ev.stage, `ERROR: ${ev.message}`);
         if (ev.status === 'skipped') log(ev.stage, 'Skipped because an earlier stage failed');
+      } else if (ev.type === 'run' && ev.status === 'queued') {
+        log('system', 'Waiting for a free slot: other audits are running…');
       } else if (ev.type === 'run') {
         sourceRef.current && sourceRef.current.close();
         setRunStatus(ev.status);
@@ -339,7 +377,8 @@
       }
     }
 
-    async function handleUpload(file) {
+    async function handleUpload(file, rejection) {
+      if (!file) { setError(rejection); return; }
       sourceRef.current && sourceRef.current.close();
       setRunStatus('uploading'); setStages(IDLE_STAGES); setSummaries({});
       setResult(null); setRun(null); setError(null); setLogs([]);
@@ -370,7 +409,14 @@
         }
         handleEvent(ev, created.run_id);
       };
-      source.onerror = () => { if (source.readyState === EventSource.CONNECTING) log('system', 'Connection lost, reconnecting…'); };
+      source.onerror = () => {
+        if (source.readyState === EventSource.CONNECTING) {
+          log('system', 'Connection lost, reconnecting…');
+        } else {
+          setRunStatus('failed');
+          setError('Lost the connection to this audit. The server may have restarted; please upload the file again.');
+        }
+      };
     }
 
     const busy = runStatus === 'uploading' || runStatus === 'running';
@@ -406,7 +452,7 @@
                 </div>
               </div>`}
 
-            <${UploadZone} onUpload=${handleUpload} disabled=${busy} />
+            <${UploadZone} onUpload=${handleUpload} disabled=${busy} maxMb=${health && health.max_upload_mb} />
             ${error && html`<div className="err-bar" role="alert">⚠ ${error}</div>`}
             ${run && html`<${Pipeline} stages=${stages} summaries=${summaries} runStatus=${runStatus} />`}
             ${logs.length > 0 && html`<${LiveLog} logs=${logs} running=${busy} />`}
@@ -419,6 +465,7 @@
                 </div>
                 <${StatsRow} stats=${result.stats} />
               </div>
+              <${SummaryPanel} result=${result} />
               ${result.findings.length > 0 && html`<${FindingsSection} findings=${result.findings} />`}
               <${DownloadBanner} runId=${result.run_id} referenceId=${result.reference_id} />`}
           </div>

@@ -10,7 +10,7 @@ Every landmine (L1–L14) in the grill sheet is fixed or made accurate, and each
 | # | Landmine | Fix | Test |
 |---|---|---|---|
 | L1 | Fixer overwrote `audit_flag`, so the critical flag was lost | Flags accumulate per row in rank order in `audit_flags`, plus a long-format `flags` list. Flags on a removed duplicate move to the kept row. | `test_higher_priority_flag_is_never_lost`, `test_every_finding_gets_exactly_one_action_and_its_flag` |
-| L2 | PDF dropped findings 21–33 (`ranked[:20]`) | The findings table is rendered from data, not by the LLM. Every finding is listed. | `test_pdf_lists_every_finding` (extracts PDF text and checks every ID) |
+| L2 | PDF dropped findings 21–33 (`ranked[:20]`) | The findings table is rendered from data, not by the LLM. Every finding is listed. | `test_pdf_lists_every_finding_once_signed` (extracts PDF text and checks every ID) |
 | L3 | About 25 of 27 LLM calls produced output nobody saw | Scout and Fixer LLM calls removed. Regulatory notes are a reviewed static table (`regulatory.py`). The only LLM calls left are the ranking review (shown in the UI) and the executive summary (in the PDF). | `test_review_suggestions_are_validated_and_advisory` |
 | L4 | SSE double framing (`data: data:`) hidden by an empty `catch` | One framing function (`runs.sse_frame`) and a plain `StreamingResponse`. The frontend uses a real `EventSource` and logs parse errors. | `test_sse_frames_are_single_encoded`, `test_full_audit_over_http` (asserts no `data: data:`) |
 | L5 | Fixer deleted and overwrote regulated records | The source is read-only. Corrections go to a proposed copy, and a change log records old value, new value, rule and reason. The SHA-256 of the upload is in the report. Missing dates stay empty. | `test_fixer_never_modifies_source`, `test_only_exact_duplicates_are_removed_and_each_is_logged`, `test_missing_dates_stay_empty` |
@@ -37,11 +37,11 @@ Every landmine (L1–L14) in the grill sheet is fixed or made accurate, and each
 - **Q44 LLM outage.** Typed SDK errors, timeout and retry settings. Every call has a deterministic fallback.
 - **Q48 / Q50 / Q51 API.** `POST /api/runs` reads and validates the upload *before* starting (413/415/422). SSE is a resumable GET (`test_events_resume_from_last_event_id`).
 - **Q52** `425` replaced with `409` and `404`. **Q53** CPU work runs in `asyncio.to_thread`. **Q54** `lifespan` replaces `on_event`.
-- **Q55 PDF.** Every string is XML-escaped (`test_pdf_escapes_markup_from_data`), there is one signature block, and column widths are fixed.
+- **Q55 PDF.** Every string is XML-escaped (`test_pdf_escapes_markup_and_wraps_long_tokens`), there is one signature block, and column widths are fixed.
 - **Q56 CORS.** Off by default because the API serves the frontend on the same origin. Allowed origins are set through an env variable.
 - **Q57 / Q59 Frontend.** No in-browser Babel. React 18.3.1 and htm are vendored (no CDN at runtime). There's no hard-coded `localhost`. The "written to Cognee" text is gone, and the LLM status comes from `/api/health`.
 - **Q60 Accessibility.** The live log is an ARIA live region, finding rows work from the keyboard, and the upload control is a labelled input.
-- **Q73 / Q74 Security.** Upload size and row limits. CSV formula-injection protection on every export (`test_csv_export_neutralises_formulas`). `push-to-github.bat` is deleted: it rewrote `.gitignore` and hard-coded a different git identity.
+- **Q73 / Q74 Security.** Upload size and row limits. CSV formula-injection protection on every export (`test_formula_injection_is_neutralised`). `push-to-github.bat` is deleted: it rewrote `.gitignore` and hard-coded a different git identity.
 - **Ops.** Dockerfile (non-root, healthcheck), GitHub Actions CI (ruff + pytest), pinned requirements.
 
 ## Updated rapid-fire answers (§17 of the grill sheet)
@@ -60,7 +60,7 @@ Every landmine (L1–L14) in the grill sheet is fixed or made accurate, and each
 
 ## Before the interview
 
-- Run `pytest -q` once so you can say "45 tests" first-hand.
+- Run `pytest -q` once so you can quote the test count first-hand (139 after the hardening pass; see `2026-09-25-production-hardening.md`).
 - Time one real run with `ANTHROPIC_API_KEY` set and memorise the number. It isn't measured yet.
 - Replace the example spec in `backend/config/spec_limits.json` if you demo with other data.
 - Re-read the new Dive Deep story: "I audited my own output, found the flag overwrite and the missing findings, and added invariant tests so they can't come back."

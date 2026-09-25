@@ -1,5 +1,7 @@
 from collections import Counter
 
+import pytest
+
 from agents.scout import run_scout
 from conftest import TODAY, frame, normal_rows
 from settings import SpecLimits
@@ -75,9 +77,25 @@ def test_lot_conflict_catches_any_differing_field(spec):
         "LOT7,PROD-A,2026-01-01,100,kg,70,4.0,INSP-02,FAC-01,PASS,second",
     ])
     result = run_scout(df, spec, today=TODAY)
-    # notes are free text and ignored; the inspector mismatch is not.
     assert types(result) == {"lot_conflict": 1}
-    assert result.findings[0].details["conflicting_fields"] == ["inspector_id"]
+    assert result.findings[0].details["conflicting_fields"] == ["inspector_id", "notes"]
+
+
+def test_repeated_lot_differing_only_in_notes_is_still_reported(spec):
+    df = frame([
+        "LOT7,PROD-A,2026-01-01,100,kg,70,4.0,INSP-01,FAC-01,PASS,first entry",
+        "LOT7,PROD-A,2026-01-01,100,kg,70,4.0,INSP-01,FAC-01,PASS,re-keyed",
+    ])
+    result = run_scout(df, spec, today=TODAY)
+    assert types(result) == {"lot_conflict": 1}
+
+
+def test_long_value_lists_are_summarised(spec):
+    rows = [f"LOT7,PROD-A,2026-01-01,{100 + i},kg,70,4.0,INSP-01,FAC-01,PASS," for i in range(40)]
+    result = run_scout(frame(rows), spec, today=TODAY)
+    conflict = next(f for f in result.findings if f.issue_type == "lot_conflict")
+    assert "and 35 more" in conflict.reason
+    assert len(conflict.row_ids) == 40
 
 
 def test_contradiction_uses_configured_spec_both_sides(spec):
@@ -91,6 +109,7 @@ def test_contradiction_uses_configured_spec_both_sides(spec):
     contradictions = [f for f in result.findings if f.issue_type == "compliance_contradiction"]
     assert sorted(f.lot_numbers[0] for f in contradictions) == ["COLD", "HOT"]
     assert "FDA" not in " ".join(f.reason for f in contradictions)
+    assert [f.details["violations"][0]["spec"] for f in contradictions] == ["20 to 85"] * 2
 
 
 def test_per_product_spec_overrides_default():
@@ -149,7 +168,70 @@ def test_invalid_and_future_dates(spec):
     }
 
 
-def test_optional_columns_can_be_absent(spec):
+def test_optional_columns_can_be_absent_and_skips_are_reported(spec):
     df = frame(["A", "B", "A"], header="lot_number")
     result = run_scout(df, spec, today=TODAY)
     assert types(result) == {"exact_duplicate": 1}
+    skipped = " ".join(result.skipped_checks)
+    assert "compliance_status" in skipped and "batch_date" in skipped and "product_id" in skipped
+
+
+def test_spec_parameter_missing_from_file_is_reported(spec):
+    df = frame(["A,PASS"], header="lot_number,compliance_status")
+    result = run_scout(df, spec, today=TODAY)
+    assert any("temperature_c" in s for s in result.skipped_checks)
+
+
+@pytest.mark.parametrize("row,column,problem", [
+    ("A,PROD-A,2026-01-01,100,kg,hot,4.0,I,F,PASS,", "temperature_c", "not a number"),
+    ("A,PROD-A,2026-01-01,100,kg,inf,4.0,I,F,PASS,", "temperature_c", "not a number"),
+    ("A,PROD-A,2026-01-01,100,kg,70,4.0.1,I,F,PASS,", "pressure_bar", "not a number"),
+    ("A,PROD-A,2026-01-01,abc,kg,70,4.0,I,F,PASS,", "quantity", "not a number"),
+    ("A,PROD-A,2026-01-01,-5,kg,70,4.0,I,F,PASS,", "quantity", "not positive"),
+    ("A,PROD-A,2026-01-01,0,kg,70,4.0,I,F,PASS,", "quantity", "not positive"),
+    ("A,PROD-A,2026-01-01,100,kg,,4.0,I,F,PASS,", "temperature_c", "missing required measurement"),
+    ("A,PROD-A,2026-01-01,100,kg,70,4.0,I,F,,", "compliance_status", "missing status"),
+    ("A,PROD-A,2026-01-01,100,kg,70,4.0,I,F,OK,", "compliance_status", "unrecognised status"),
+])
+def test_invalid_values_are_never_silently_skipped(spec, row, column, problem):
+    result = run_scout(frame([row]), spec, today=TODAY)
+    invalid = [f for f in result.findings if f.issue_type == "invalid_value"]
+    assert [(f.details["column"], f.details["problem"]) for f in invalid] == [(column, problem)]
+
+
+def test_missing_measurement_on_fail_record_is_not_flagged(spec):
+    result = run_scout(frame(["A,PROD-A,2026-01-01,100,kg,,4.0,I,F,FAIL,"]), spec, today=TODAY)
+    assert not result.findings
+
+
+def test_status_matching_ignores_case_and_whitespace(spec):
+    result = run_scout(frame(["A,PROD-A,2026-01-01,100,kg,90,4.0,I,F, pass ,"]), spec, today=TODAY)
+    assert types(result) == {"compliance_contradiction": 1}
+
+
+def test_future_date_grace_for_time_zones(spec):
+    df = frame([
+        "A,PROD-A,2026-09-26,100,kg,70,4.0,I,F,PASS,",   # tomorrow in UTC: allowed
+        "B,PROD-A,2026-09-28,100,kg,70,4.0,I,F,PASS,",   # clearly future
+        "C,PROD-A,2026-09-25T23:00:00+09:00,100,kg,70,4.0,I,F,PASS,",
+    ])
+    result = run_scout(df, spec, today=TODAY)
+    assert [f.lot_numbers[0] for f in result.findings] == ["B"]
+
+
+def test_empty_product_rows_are_scored_against_all_records(spec):
+    rows = normal_rows(30)
+    rows.append("ODD,,2026-02-01,100,kg,70,9.9,INSP-01,FAC-01,FAIL,")
+    result = run_scout(frame(rows), spec, today=TODAY)
+    odd = [f for f in result.findings if f.lot_numbers == ["ODD"]]
+    assert [f.details["baseline"] for f in odd] == ["all records"]
+
+
+def test_outlier_threshold_is_configurable(spec):
+    from dataclasses import replace
+    rows = normal_rows(40)
+    rows.append("MILD,PROD-A,2026-02-01,100,kg,73.5,4.0,INSP-01,FAC-01,FAIL,")
+    strict = run_scout(frame(rows), replace(spec, outlier_z=3.0), today=TODAY)
+    lenient = run_scout(frame(rows), replace(spec, outlier_z=10.0), today=TODAY)
+    assert any(f.lot_numbers == ["MILD"] for f in strict.findings)
+    assert not any(f.lot_numbers == ["MILD"] for f in lenient.findings)

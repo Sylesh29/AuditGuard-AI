@@ -7,3 +7,5 @@ venv/
 .ruff_cache/
 *.db
 *.log
+.coverage
+.hypothesis/

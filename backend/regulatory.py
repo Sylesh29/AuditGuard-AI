@@ -14,6 +14,10 @@ REGULATORY_REFERENCES: dict[str, str] = {
         "ALCOA+: Consistent, Accurate."
     ),
     "exact_duplicate": "ISO 13485:2016 §4.2.5 (control of records). ALCOA+: Consistent.",
+    "invalid_value": (
+        "ISO 13485:2016 §4.2.5 (records must remain legible and complete) and §8.2.6 where the "
+        "value is an acceptance measurement. ALCOA+: Complete, Accurate."
+    ),
     "unit_conflict": (
         "ISO 13485:2016 §4.2.5 (records must remain legible and readily identifiable). "
         "ALCOA+: Accurate, Consistent."
@@ -59,4 +63,8 @@ OPEN_ITEM_INSTRUCTIONS: dict[str, str] = {
         "must be investigated."
     ),
     "exact_duplicate": "Approve removal of the duplicate copies through change control.",
+    "invalid_value": (
+        "Enter the value from the instrument or batch record. If a required measurement was "
+        "never taken, document the gap as a deviation; do not back-fill it."
+    ),
 }

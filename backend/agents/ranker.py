@@ -14,10 +14,11 @@ PRIORITY: dict[str, int] = {
     "compliance_contradiction": 1,  # the record contradicts itself
     "lot_conflict": 2,              # two versions of the truth, cannot be auto-resolved
     "exact_duplicate": 3,           # truth is known, removal is safe
-    "unit_conflict": 4,
-    "statistical_outlier": 5,
-    "invalid_timestamp": 6,
-    "missing_timestamp": 7,
+    "invalid_value": 4,             # the record cannot show what was measured
+    "unit_conflict": 5,
+    "statistical_outlier": 6,
+    "invalid_timestamp": 7,
+    "missing_timestamp": 8,
 }
 SEVERITY_ORDER = {"HIGH": 0, "MED": 1, "LOW": 2}
 
@@ -49,6 +50,8 @@ def _ranking_reason(finding: Finding) -> str:
         "correct values cannot be recovered from the data alone.",
         "exact_duplicate": "Duplicate copies make the record count wrong, but the true values are "
         "known, so the fix is low-risk.",
+        "invalid_value": "A missing or unreadable value means the record cannot show what was "
+        "measured or decided.",
         "unit_conflict": "The batch weight cannot be verified until one unit of measure is confirmed.",
         "statistical_outlier": "An extreme reading needs an explanation before submission.",
         "invalid_timestamp": "An impossible or unreadable date undermines the production timeline.",

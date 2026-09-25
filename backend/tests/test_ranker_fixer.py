@@ -4,7 +4,7 @@ import random
 from agents.fixer import FLAG_COLUMN, run_fixer
 from agents.ranker import rank_findings, review_ranking
 from agents.scout import run_scout
-from conftest import TODAY, FakeLLM, frame
+from conftest import HEADER, TODAY, FakeLLM, frame
 from models import RankingReview, ReviewSuggestion
 
 
@@ -100,3 +100,54 @@ def test_missing_dates_stay_empty(sample_df, spec):
     corrected, _ = run_fixer(sample_df, ranked_sample(sample_df, spec), spec)
     missing = sample_df.index[sample_df.batch_date.isna()]
     assert corrected.loc[missing, "batch_date"].isna().all()
+
+
+def test_disagreeing_units_are_flagged_not_converted(spec):
+    df = frame([
+        "LOT9,PROD-A,2026-01-01,180,kg,70,4.0,INSP-01,FAC-01,PASS,",
+        "LOT9,PROD-A,2026-01-01,500,lbs,70,4.0,INSP-01,FAC-01,PASS,",
+    ])
+    ranked = rank_findings(run_scout(df, spec, today=TODAY).findings)
+    corrected, result = run_fixer(df, ranked, spec)
+    assert result.change_log == []
+    assert corrected.equals(df.assign(audit_flags=corrected["audit_flags"]))
+    unit_id = next(r.finding_id for r in ranked if r.issue_type == "unit_conflict")
+    assert result.action_map()[unit_id].action == "flagged"
+
+
+def test_unknown_unit_is_flagged_not_converted(spec):
+    df = frame([
+        "LOT9,PROD-A,2026-01-01,180,kg,70,4.0,INSP-01,FAC-01,PASS,",
+        "LOT9,PROD-A,2026-01-01,6350,oz,70,4.0,INSP-01,FAC-01,PASS,",
+    ])
+    ranked = rank_findings(run_scout(df, spec, today=TODAY).findings)
+    _, result = run_fixer(df, ranked, spec)
+    assert result.change_log == []
+
+
+def test_existing_audit_flags_column_is_never_overwritten(spec):
+    header = HEADER + ",audit_flags"
+    df = frame(["A,PROD-A,,100,kg,70,4.0,INSP-01,FAC-01,PASS,,customer note"], header=header)
+    ranked = rank_findings(run_scout(df, spec, today=TODAY).findings)
+    corrected, _ = run_fixer(df, ranked, spec)
+    assert corrected.at[0, "audit_flags"] == "customer note"
+    assert corrected.at[0, "auditguard_audit_flags"].startswith("MISSING_BATCH_DATE")
+
+
+def test_flags_on_removed_duplicates_move_to_the_kept_row(spec):
+    df = frame([
+        "A,PROD-A,,100,kg,70,4.0,INSP-01,FAC-01,PASS,",
+        "A,PROD-A,,100,kg,70,4.0,INSP-01,FAC-01,PASS,",
+    ])
+    ranked = rank_findings(run_scout(df, spec, today=TODAY).findings)
+    corrected, result = run_fixer(df, ranked, spec)
+    assert corrected.index.tolist() == [0]
+    assert corrected.at[0, "audit_flags"].split(" | ")[0].startswith("DUPLICATE_REMOVED")
+    assert "MISSING_BATCH_DATE" in corrected.at[0, "audit_flags"]
+
+
+def test_actions_follow_rank_order(sample_df, spec):
+    ranked = ranked_sample(sample_df, spec)
+    _, result = run_fixer(sample_df, ranked, spec)
+    rank_of = {r.finding_id: r.rank for r in ranked}
+    assert [rank_of[a.finding_id] for a in result.actions] == sorted(rank_of.values())

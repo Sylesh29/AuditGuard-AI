@@ -9,6 +9,7 @@ IssueType = Literal[
     "compliance_contradiction",
     "lot_conflict",
     "exact_duplicate",
+    "invalid_value",
     "unit_conflict",
     "statistical_outlier",
     "invalid_timestamp",
@@ -21,6 +22,7 @@ ISSUE_LABELS: dict[str, str] = {
     "compliance_contradiction": "Status contradicts spec",
     "lot_conflict": "Conflicting lot records",
     "exact_duplicate": "Exact duplicate",
+    "invalid_value": "Missing or invalid value",
     "unit_conflict": "Unit conflict",
     "statistical_outlier": "Statistical outlier",
     "invalid_timestamp": "Invalid batch date",
@@ -46,6 +48,7 @@ class Finding(BaseModel):
 class ScoutResult(BaseModel):
     findings: list[Finding]
     rows_scanned: int
+    skipped_checks: list[str] = Field(default_factory=list)
 
     @property
     def summary(self) -> dict[str, int]:
@@ -119,8 +122,8 @@ class FixerResult(BaseModel):
             "changes_logged": len(self.change_log),
         }
 
-    def action_for(self, finding_id: str) -> Action | None:
-        return next((a for a in self.actions if a.finding_id == finding_id), None)
+    def action_map(self) -> dict[str, Action]:
+        return {a.finding_id: a for a in self.actions}
 
 
 class ExecutiveSummary(BaseModel):
