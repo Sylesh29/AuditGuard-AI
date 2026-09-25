@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 load_dotenv()
 
 from ingest import UploadError, load_csv  # noqa: E402
-from llm import AnthropicLLM, StructuredLLM  # noqa: E402
+from llm import StructuredLLM, create_llm  # noqa: E402
 from pipeline import execute, findings_payload  # noqa: E402
 from runs import Run, RunStore, sse_frame  # noqa: E402
 from settings import Settings, SpecLimits, get_settings  # noqa: E402
@@ -55,7 +55,7 @@ SECURITY_HEADERS = {
 def create_app(settings: Settings | None = None, llm: StructuredLLM | None = None) -> FastAPI:
     settings = settings or get_settings()
     spec = SpecLimits.load(settings.spec_path)  # fail fast on a bad spec file
-    llm = llm or AnthropicLLM(settings)
+    llm = llm or create_llm(settings)
     store = RunStore(settings.max_stored_runs, settings.run_ttl_s)
     slots = asyncio.Semaphore(settings.max_concurrent_runs)
     # Parsing happens inside the upload request; bound it too so parallel uploads cannot
@@ -66,7 +66,7 @@ def create_app(settings: Settings | None = None, llm: StructuredLLM | None = Non
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("AuditGuard %s starting (LLM %s, spec %s)", __version__,
-                    llm.model if llm.enabled else "disabled", spec.sha256[:12])
+                    f"{llm.provider}/{llm.model}" if llm.enabled else "disabled", spec.sha256[:12])
         yield
         for run in store.active():
             if run.task:
@@ -108,6 +108,7 @@ def create_app(settings: Settings | None = None, llm: StructuredLLM | None = Non
     @app.get("/api/health")
     async def health() -> dict:
         return {"status": "ok", "version": __version__, "llm_enabled": llm.enabled,
+                "llm_provider": llm.provider if llm.enabled else None,
                 "llm_model": llm.model if llm.enabled else None,
                 "max_upload_mb": settings.max_upload_bytes // 2**20,
                 "max_rows": settings.max_rows}

@@ -1,14 +1,20 @@
 import asyncio
+import io
+import json
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pypdf import PdfReader
 
+import pipeline
 from conftest import SAMPLE_CSV, FakeLLM, with_settings
+from llm import GroqLLM
 from main import create_app
 from models import ExecutiveSummary, RankingReview, ReviewSuggestion
 from runs import Run, RunStore, sse_frame
-from settings import SpecError, SpecLimits
+from settings import DEFAULT_FRONTEND_DIR, SpecError, SpecLimits
 
 
 def client_for(settings, llm=None) -> TestClient:
@@ -134,8 +140,6 @@ def test_unknown_run_and_artifact(settings):
 
 
 def test_stage_failure_fails_closed(settings, monkeypatch):
-    import pipeline
-
     async def broken(ctx):
         raise RuntimeError("boom")
 
@@ -177,7 +181,6 @@ def test_health_reports_limits(settings):
 
 
 def test_frontend_is_served_when_configured(settings):
-    from settings import DEFAULT_FRONTEND_DIR
     with client_for(with_settings(settings, frontend_dir=DEFAULT_FRONTEND_DIR)) as client:
         page = client.get("/")
         assert page.status_code == 200 and "app.js" in page.text
@@ -240,3 +243,29 @@ def test_heartbeat_while_waiting():
         await run.finish("complete")
         assert (await anext(stream))["status"] == "complete"
     asyncio.run(scenario())
+
+
+def test_full_audit_with_groq_provider(settings):
+    def groq_api(request):
+        system = json.loads(request.content)["messages"][0]["content"]
+        if "suggestions" in system:
+            content = {"suggestions": []}
+        else:
+            content = {"summary": "AuditGuard AI found 41 issues; F009 is the most serious."}
+        return httpx.Response(200, json={
+            "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": json.dumps(content)}}]})
+
+    groq_settings = with_settings(settings, llm_provider="groq", llm_enabled=True,
+                                  groq_api_key="gsk-test", llm_model="llama-3.3-70b-versatile")
+    llm = GroqLLM(groq_settings, http_client=httpx.AsyncClient(transport=httpx.MockTransport(groq_api)))
+    with client_for(groq_settings, llm) as client:
+        assert client.get("/api/health").json()["llm_provider"] == "groq"
+        run_id = run_sample(client)
+        data = client.get(f"/api/runs/{run_id}/findings").json()
+        pdf = client.get(f"/api/runs/{run_id}/report.pdf").content
+    assert data["summary_source"] == "llm" and data["review_status"] == "no_changes"
+    assert data["executive_summary"].startswith("AuditGuard AI found 41 issues")
+    text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf)).pages)
+    assert "groq: llama-3.3-70b-versatile" in text

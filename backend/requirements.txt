@@ -1,4 +1,5 @@
 anthropic==1.8.0
+groq==1.7.0
 fastapi==0.141.1
 uvicorn[standard]==0.54.0
 python-multipart==0.0.32

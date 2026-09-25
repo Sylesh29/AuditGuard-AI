@@ -157,6 +157,13 @@ class SpecLimits:
         return cls.from_dict(raw, sha256=hashlib.sha256(content).hexdigest())
 
 
+DEFAULT_MODELS = {
+    "anthropic": "claude-sonnet-4-6",
+    # Groq's catalogue changes often; override with AUDITGUARD_LLM_MODEL if this is retired.
+    "groq": "llama-3.3-70b-versatile",
+}
+
+
 @dataclass(frozen=True)
 class Settings:
     anthropic_api_key: str | None
@@ -172,18 +179,27 @@ class Settings:
     allowed_origins: list[str]
     spec_path: Path
     frontend_dir: Path | None
+    llm_provider: str = "anthropic"
+    groq_api_key: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
         api_key = os.getenv("ANTHROPIC_API_KEY") or None
+        groq_key = os.getenv("GROQ_API_KEY") or None
+        provider = os.getenv("AUDITGUARD_LLM_PROVIDER", "auto").strip().lower()
+        if provider == "auto":
+            provider = "groq" if groq_key and not api_key else "anthropic"
+        if provider not in DEFAULT_MODELS:
+            raise ValueError(f"AUDITGUARD_LLM_PROVIDER must be one of {sorted(DEFAULT_MODELS)}.")
+        provider_key = groq_key if provider == "groq" else api_key
         llm_flag = os.getenv("AUDITGUARD_LLM_ENABLED", "auto").lower()
-        llm_enabled = bool(api_key) if llm_flag == "auto" else llm_flag in {"1", "true", "yes"}
+        llm_enabled = bool(provider_key) if llm_flag == "auto" else llm_flag in {"1", "true", "yes"}
         frontend = os.getenv("AUDITGUARD_FRONTEND_DIR")
         frontend_dir = Path(frontend) if frontend else DEFAULT_FRONTEND_DIR
         return cls(
             anthropic_api_key=api_key,
             llm_enabled=llm_enabled,
-            llm_model=os.getenv("AUDITGUARD_LLM_MODEL", "claude-sonnet-4-6"),
+            llm_model=os.getenv("AUDITGUARD_LLM_MODEL") or DEFAULT_MODELS[provider],
             llm_timeout_s=_env_float("AUDITGUARD_LLM_TIMEOUT_S", 60.0),
             llm_max_retries=_env_int("AUDITGUARD_LLM_MAX_RETRIES", 2),
             max_upload_bytes=_env_int("AUDITGUARD_MAX_UPLOAD_MB", 50) * 1024 * 1024,
@@ -194,6 +210,8 @@ class Settings:
             allowed_origins=_env_list("AUDITGUARD_ALLOWED_ORIGINS"),
             spec_path=Path(os.getenv("AUDITGUARD_SPEC_FILE", str(DEFAULT_SPEC_PATH))),
             frontend_dir=frontend_dir if frontend_dir.is_dir() else None,
+            llm_provider=provider,
+            groq_api_key=groq_key,
         )
 
 

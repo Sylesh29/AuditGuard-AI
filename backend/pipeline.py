@@ -90,7 +90,7 @@ def configuration(ctx: Context) -> dict[str, str]:
     return {
         "AuditGuard version": __version__,
         "Process spec SHA-256": ctx.spec.sha256 or "(built-in)",
-        "Language model": ctx.llm.model if ctx.llm.enabled else "not used",
+        "Language model": f"{ctx.llm.provider}: {ctx.llm.model}" if ctx.llm.enabled else "not used",
         "File encoding": f"{ctx.dataset.encoding}, delimiter {ctx.dataset.delimiter!r}",
     }
 

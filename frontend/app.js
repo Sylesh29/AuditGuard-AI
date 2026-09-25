@@ -434,7 +434,7 @@
           <div className="header-right">
             <div className="conn-pill">
               <span className=${`conn-dot${health ? '' : ' off'}`} />
-              ${health ? (health.llm_enabled ? 'API connected' : 'API connected · LLM off') : 'API offline'}
+              ${health ? (health.llm_enabled ? `API connected · ${health.llm_provider}` : 'API connected · LLM off') : 'API offline'}
             </div>
           </div>
         </header>

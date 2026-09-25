@@ -21,14 +21,14 @@
 
 **Deterministic rules detect and decide. The LLM only explains.**
 
-In a regulated setting you must be able to say *why* a record was flagged and get the same answer twice. So detection, ranking, corrections, every table and every count are plain code. Claude is used in two places, and both are optional:
+In a regulated setting you must be able to say *why* a record was flagged and get the same answer twice. So detection, ranking, corrections, every table and every count are plain code. An LLM is used in two places, and both are optional. The provider is pluggable: **Anthropic Claude** or **Groq**.
 
 | Where | What the LLM does | Guardrail |
 |---|---|---|
 | Ranker | Gives a second opinion on the ranking | Advisory only. The ranking never changes. Suggestions are validated against real finding IDs and shown to a human in the UI and PDF. |
 | Narrator | Writes the executive-summary paragraph | Rejected, and a template used instead, unless every finding ID and number in it appears in the data it was shown. It must also state the true total and must not claim the data is clean. |
 
-Both calls use structured outputs and run concurrently. Timeouts, rate limits, outages, truncated output and refusals all fall back to deterministic text. They never fail the audit. Without an API key, the full pipeline still runs.
+Both calls return schema-validated JSON (Claude's structured outputs, or Groq's JSON mode checked against the same Pydantic model) and run concurrently. Timeouts, rate limits, outages, truncated output and refusals all fall back to deterministic text. They never fail the audit. Without an API key, the full pipeline still runs.
 
 ## Pipeline
 
@@ -108,7 +108,7 @@ The sample runs in about 0.3 s. With an API key, the two Claude calls run concur
 cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-cp .env.example .env          # optional: add ANTHROPIC_API_KEY
+cp .env.example .env          # optional: add ANTHROPIC_API_KEY or GROQ_API_KEY
 uvicorn main:app --port 8000
 ```
 
@@ -118,7 +118,7 @@ Open <http://localhost:8000> and drop in `data/sample.csv`. The API serves the f
 
 ```bash
 docker build -t auditguard .
-docker run -p 8000:8000 -e ANTHROPIC_API_KEY=... auditguard
+docker run -p 8000:8000 -e ANTHROPIC_API_KEY=... auditguard   # or -e GROQ_API_KEY=...
 ```
 
 The image runs as a non-root user and has a healthcheck. CI builds it and audits the sample inside it.
@@ -131,10 +131,10 @@ HYPOTHESIS_PROFILE=thorough pytest -q -k properties   # thousands of generated d
 ruff check backend
 ```
 
-139 tests at 98% line coverage, with warnings treated as errors:
+162 tests at 98% line coverage, with warnings treated as errors:
 - **Detectors** (`test_scout.py`): every rule, its edge cases, and one regression test per past bug.
 - **Invariants** (`test_properties.py`, Hypothesis): for any messy input, the source is untouched, every finding gets exactly one action and a flag on a surviving row, only true duplicates are removed, change logs hold the real old values, and exports never lose a finding or emit a formula cell. The parser never crashes on arbitrary bytes.
-- **Real SDK** (`test_llm.py`): the Anthropic client runs against a mock HTTP transport. It checks the exact request (model, schema, prompt) and the fallback on every error class, on truncation and on refusal.
+- **Real SDKs** (`test_llm.py`): the Anthropic and Groq clients run against a mock HTTP transport. They check the exact request (model, schema, prompt, JSON mode) and the fallback on every error class, on truncation and on refusal. Provider selection from the environment is also tested.
 - **API** (`test_api.py`): end to end over HTTP, including SSE resume, queueing, run isolation, fail-closed behaviour, limits, security headers and spec validation.
 - **Performance** (`test_performance.py`).
 
@@ -144,8 +144,9 @@ All settings are environment variables. See `backend/.env.example`.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | unset | Enables the LLM review and summary |
-| `AUDITGUARD_LLM_MODEL` | `claude-sonnet-4-6` | Model for both LLM calls |
+| `ANTHROPIC_API_KEY` / `GROQ_API_KEY` | unset | Enables the LLM review and summary with that provider |
+| `AUDITGUARD_LLM_PROVIDER` | `auto` | `anthropic` or `groq`. Auto picks Anthropic when its key is set, otherwise Groq. |
+| `AUDITGUARD_LLM_MODEL` | `claude-sonnet-4-6` / `llama-3.3-70b-versatile` | Model for both LLM calls (default depends on the provider) |
 | `AUDITGUARD_SPEC_FILE` | `backend/config/spec_limits.json` | Process spec: per-product limits, pass/fail statuses, unit conversions, outlier threshold (`outlier_robust_z`). Validated at startup. |
 | `AUDITGUARD_MAX_UPLOAD_MB` / `AUDITGUARD_MAX_ROWS` | 50 / 500000 | Upload limits |
 | `AUDITGUARD_MAX_CONCURRENT_RUNS` | 2 | Further uploads queue |
@@ -189,14 +190,25 @@ backend/
   runs.py          per-run state, event log, SSE framing, retention
   ingest.py        upload parsing: encodings, delimiters, header aliases, validation
   settings.py      env settings + validated process-spec loader
-  llm.py           Anthropic client wrapper with deterministic fallback
+  llm.py           Anthropic and Groq providers behind one interface, with deterministic fallback
   models.py        typed stage contracts (Pydantic)
   regulatory.py    reviewed reference text and instructions per issue type
   version.py
   agents/          scout.py · ranker.py · fixer.py · narrator.py
   utils/           pdf_gen.py · csv_export.py
   config/          spec_limits.json
-  tests/           139 tests
+  tests/           162 tests
 frontend/          static React + htm, vendored, no build step
 docs/              dated change reports
 ```
+
+## Testing with Groq
+
+```bash
+cd backend
+echo "GROQ_API_KEY=gsk_your_key_here" >> .env    # .env is git-ignored; never commit a key
+uvicorn main:app --port 8000
+curl -s localhost:8000/api/health               # expect "llm_provider": "groq"
+```
+
+Upload `data/sample.csv` in the UI. The executive summary panel should drop "(template)", and the report's configuration block reads `groq: llama-3.3-70b-versatile`. If Groq has retired that model, set `AUDITGUARD_LLM_MODEL` to a current one from the Groq console. If a Groq answer fails validation, the report quietly falls back to the template and the server log says why.
