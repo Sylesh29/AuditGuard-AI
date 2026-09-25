@@ -1,12 +1,12 @@
-﻿{
+{
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "frontend",
-      "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "http.server", "5500"],
-      "port": 5500,
-      "cwd": "frontend"
+      "name": "auditguard",
+      "runtimeExecutable": "uvicorn",
+      "runtimeArgs": ["main:app", "--port", "8000"],
+      "port": 8000,
+      "cwd": "backend"
     }
   ]
 }

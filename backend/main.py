@@ -1,249 +1,176 @@
-﻿"""FastAPI application for AuditGuard AI — 4-agent manufacturing data rescue pipeline."""
-import os
-import io
-import json
+"""AuditGuard AI HTTP API.
+
+  POST /api/runs                  upload a CSV; validated synchronously, returns 202 + run_id
+  GET  /api/runs/{id}             run status per stage
+  GET  /api/runs/{id}/events      Server-Sent Events (resumable with Last-Event-ID)
+  GET  /api/runs/{id}/findings    ranked findings joined with actions (409 until complete)
+  GET  /api/runs/{id}/report.pdf | findings.csv | corrected.csv | changelog.csv
+  GET  /api/health
+The static frontend is served from / so the browser talks to the API on the same origin.
+"""
+from __future__ import annotations
+
 import asyncio
 import logging
-from datetime import date
-from typing import AsyncGenerator
+from contextlib import asynccontextmanager
 
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, Response
-from sse_starlette.sse import EventSourceResponse
 from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
-load_dotenv(override=True)
+load_dotenv()
 
-from agents.scout import run_scout
-from agents.ranker import run_ranker
-from agents.fixer import run_fixer
-from agents.narrator import run_narrator
-from memory.cognee_store import init_cognee, clear_session, read_memory
-from utils.pdf_gen import markdown_to_pdf
+from ingest import UploadError, load_csv  # noqa: E402
+from llm import AnthropicLLM, StructuredLLM  # noqa: E402
+from pipeline import execute, findings_payload  # noqa: E402
+from runs import Run, RunStore, sse_frame  # noqa: E402
+from settings import Settings, SpecLimits, get_settings  # noqa: E402
+from version import __version__  # noqa: E402
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("auditguard")
 
-app = FastAPI(title="AuditGuard AI", version="1.0.0")
+ARTIFACT_TYPES = {
+    "report.pdf": "application/pdf",
+    "findings.csv": "text/csv; charset=utf-8",
+    "corrected.csv": "text/csv; charset=utf-8",
+    "changelog.csv": "text/csv; charset=utf-8",
+}
+MULTIPART_OVERHEAD = 64 * 1024
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Single-user in-memory session store
-session = {
-    "df_original": None,
-    "df_fixed": None,
-    "narrative_md": None,
-    "narrative_pdf": None,
-    "filename": None,
-    "status": "idle",
-    "agent_statuses": {
-        "scout": "idle",
-        "ranker": "idle",
-        "fixer": "idle",
-        "narrator": "idle"
-    },
-    "findings_data": None
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; "
+        "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+        "form-action 'self'; frame-ancestors 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
 }
 
 
-@app.on_event("startup")
-async def startup():
-    await init_cognee()
+def create_app(settings: Settings | None = None, llm: StructuredLLM | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    spec = SpecLimits.load(settings.spec_path)  # fail fast on a bad spec file
+    llm = llm or AnthropicLLM(settings)
+    store = RunStore(settings.max_stored_runs, settings.run_ttl_s)
+    slots = asyncio.Semaphore(settings.max_concurrent_runs)
+    # Parsing happens inside the upload request; bound it too so parallel uploads cannot
+    # exhaust memory before a run even exists.
+    parse_slots = asyncio.Semaphore(settings.max_concurrent_runs * 2)
+    upload_limit = settings.max_upload_bytes + MULTIPART_OVERHEAD
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        logger.info("AuditGuard %s starting (LLM %s, spec %s)", __version__,
+                    llm.model if llm.enabled else "disabled", spec.sha256[:12])
+        yield
+        for run in store.active():
+            if run.task:
+                run.task.cancel()
+        if hasattr(llm, "aclose"):
+            await llm.aclose()
 
-def _sse_event(data: dict) -> str:
-    return f"data: {json.dumps(data)}\n\n"
+    app = FastAPI(title="AuditGuard AI", version=__version__, lifespan=lifespan)
+    if settings.allowed_origins:
+        app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins,
+                           allow_methods=["GET", "POST"], allow_headers=["Last-Event-ID"])
 
+    @app.middleware("http")
+    async def guard(request: Request, call_next):
+        if request.method == "POST" and request.url.path == "/api/runs":
+            length = request.headers.get("content-length")
+            if length is None or not length.isdigit():
+                return JSONResponse({"detail": "Content-Length is required."}, status_code=411)
+            if int(length) > upload_limit:
+                limit_mb = settings.max_upload_bytes // 2**20
+                return JSONResponse({"detail": f"File exceeds {limit_mb} MB."}, status_code=413)
+        response = await call_next(request)
+        response.headers.update(SECURITY_HEADERS)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
-@app.post("/run-audit")
-async def run_audit(file: UploadFile = File(...)):
-    """Accept CSV, run 4-agent pipeline, stream SSE events."""
+    def get_run(run_id: str) -> Run:
+        run = store.get(run_id)
+        if run is None:
+            raise HTTPException(404, "Unknown or expired run.")
+        return run
 
-    async def pipeline_generator() -> AsyncGenerator[str, None]:
-        session["status"] = "running"
-        session["filename"] = file.filename or "upload.csv"
-        session["findings_data"] = None
-        session["narrative_pdf"] = None
+    def completed(run: Run) -> Run:
+        if run.status != "complete":
+            raise HTTPException(409, run.error or "Audit still running.")
+        return run
 
-        # Reset statuses
-        for k in session["agent_statuses"]:
-            session["agent_statuses"][k] = "idle"
+    @app.get("/api/health")
+    async def health() -> dict:
+        return {"status": "ok", "version": __version__, "llm_enabled": llm.enabled,
+                "llm_model": llm.model if llm.enabled else None,
+                "max_upload_mb": settings.max_upload_bytes // 2**20,
+                "max_rows": settings.max_rows}
 
-        # Parse CSV
+    @app.post("/api/runs", status_code=202)
+    async def create_run(file: UploadFile = File(...)) -> dict:
+        content = await file.read(settings.max_upload_bytes + 1)
+        if len(content) > settings.max_upload_bytes:
+            raise HTTPException(413, f"File exceeds {settings.max_upload_bytes // 2**20} MB.")
         try:
-            content = await file.read()
-            df = pd.read_csv(io.BytesIO(content))
-            session["df_original"] = df
-        except Exception as e:
-            yield _sse_event({"agent": "pipeline", "status": "error", "message": str(e)})
-            return
-
-        await clear_session()
-
-        # Agent 1: Scout
+            async with parse_slots:
+                dataset = await asyncio.to_thread(load_csv, content, file.filename, settings.max_rows)
+        except UploadError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
         try:
-            session["agent_statuses"]["scout"] = "running"
-            yield _sse_event({"agent": "scout", "status": "running"})
-            scout_result = await run_scout(df)
-            session["agent_statuses"]["scout"] = "complete"
-            yield _sse_event({
-                "agent": "scout",
-                "status": "complete",
-                "summary": scout_result.get("summary", {})
-            })
-        except Exception as e:
-            logger.error(f"Scout error: {e}")
-            session["agent_statuses"]["scout"] = "error"
-            yield _sse_event({"agent": "scout", "status": "error", "message": str(e)})
+            run = store.create(dataset.name, dataset.sha256)
+        except RuntimeError as exc:
+            raise HTTPException(503, "Too many audits in progress; try again shortly.") from exc
+        run.task = asyncio.create_task(execute(run, dataset, spec, llm, slots))
+        logger.info("run %s created: %s, %d rows, sha256 %s", run.run_id, dataset.name,
+                    len(dataset.frame), dataset.sha256[:12])
+        return {**run.public(), "events_url": f"/api/runs/{run.run_id}/events"}
 
-        # Agent 2: Ranker
-        try:
-            session["agent_statuses"]["ranker"] = "running"
-            yield _sse_event({"agent": "ranker", "status": "running"})
-            ranker_result = await run_ranker()
-            session["agent_statuses"]["ranker"] = "complete"
-            yield _sse_event({
-                "agent": "ranker",
-                "status": "complete",
-                "summary": {"ranked": len(ranker_result.get("ranked_findings", []))}
-            })
-        except Exception as e:
-            logger.error(f"Ranker error: {e}")
-            session["agent_statuses"]["ranker"] = "error"
-            yield _sse_event({"agent": "ranker", "status": "error", "message": str(e)})
+    @app.get("/api/runs/{run_id}")
+    async def run_status(run_id: str) -> dict:
+        return get_run(run_id).public()
 
-        # Agent 3: Fixer
-        try:
-            session["agent_statuses"]["fixer"] = "running"
-            yield _sse_event({"agent": "fixer", "status": "running"})
-            df_fixed, action_log = await run_fixer(df)
-            session["df_fixed"] = df_fixed
-            session["agent_statuses"]["fixer"] = "complete"
-            yield _sse_event({
-                "agent": "fixer",
-                "status": "complete",
-                "summary": action_log.get("stats", {})
-            })
-        except Exception as e:
-            logger.error(f"Fixer error: {e}")
-            session["agent_statuses"]["fixer"] = "error"
-            yield _sse_event({"agent": "fixer", "status": "error", "message": str(e)})
+    @app.get("/api/runs/{run_id}/events")
+    async def run_events(run_id: str, request: Request) -> StreamingResponse:
+        run = get_run(run_id)
+        last = request.headers.get("last-event-id", "0")
+        after = int(last) if last.isdigit() else 0
 
-        # Agent 4: Narrator
-        try:
-            session["agent_statuses"]["narrator"] = "running"
-            yield _sse_event({"agent": "narrator", "status": "running"})
-            narrative_md = await run_narrator(session["filename"])
-            session["narrative_md"] = narrative_md
-            pdf_bytes = markdown_to_pdf(narrative_md, session["filename"])
-            session["narrative_pdf"] = pdf_bytes
-            session["agent_statuses"]["narrator"] = "complete"
-            yield _sse_event({
-                "agent": "narrator",
-                "status": "complete",
-                "summary": {"pdf_ready": True}
-            })
-        except Exception as e:
-            logger.error(f"Narrator error: {e}")
-            session["agent_statuses"]["narrator"] = "error"
-            yield _sse_event({"agent": "narrator", "status": "error", "message": str(e)})
+        async def stream():
+            async for event in run.follow(after):
+                if await request.is_disconnected():
+                    return
+                yield sse_frame(event)
 
-        # Build findings data for /findings endpoint
-        try:
-            ranker_data = await read_memory("ranker")
-            fixer_data = await read_memory("fixer")
-            scout_data = await read_memory("scout")
+        return StreamingResponse(stream(), media_type="text/event-stream",
+                                 headers={"X-Accel-Buffering": "no"})
 
-            ranked = (ranker_data or {}).get("ranked_findings", [])
-            auto_fixed = {a["finding_id"]: a for a in (fixer_data or {}).get("auto_fixed", [])}
-            flagged = {f["finding_id"]: f for f in (fixer_data or {}).get("flagged", [])}
-            escalated = {e["finding_id"]: e for e in (fixer_data or {}).get("escalated", [])}
+    @app.get("/api/runs/{run_id}/findings")
+    async def run_findings(run_id: str) -> dict:
+        return findings_payload(completed(get_run(run_id)))
 
-            findings_list = []
-            for r in ranked:
-                fid = r["finding_id"]
-                action = "No action"
-                if fid in auto_fixed:
-                    action = auto_fixed[fid]["action_taken"]
-                elif fid in flagged:
-                    action = "Flagged for review"
-                elif fid in escalated:
-                    action = "Escalated — requires sign-off"
+    @app.get("/api/runs/{run_id}/{artifact}")
+    async def run_artifact(run_id: str, artifact: str) -> Response:
+        if artifact not in ARTIFACT_TYPES:
+            raise HTTPException(404, "Unknown artifact.")
+        run = completed(get_run(run_id))
+        stem, ext = artifact.rsplit(".", 1)
+        return Response(
+            run.artifacts[artifact], media_type=ARTIFACT_TYPES[artifact],
+            headers={"Content-Disposition":
+                     f'attachment; filename="AuditGuard_{stem}_{run.reference_id}.{ext}"'},
+        )
 
-                findings_list.append({
-                    "rank": r["rank"],
-                    "finding_id": fid,
-                    "issue_type": r["issue_type"].replace("_", " ").title(),
-                    "severity": r["severity"],
-                    "ranking_reason": r["ranking_reason"],
-                    "rows_affected": r["rows_affected"],
-                    "action_taken": action,
-                    "claude_note": r.get("claude_note", ""),
-                    "lot_numbers": r.get("lot_numbers", [])
-                })
+    if settings.frontend_dir:
+        app.mount("/", StaticFiles(directory=settings.frontend_dir, html=True), name="frontend")
 
-            scout_summary = (scout_data or {}).get("summary", {})
-            fixer_stats = (fixer_data or {}).get("stats", {})
-
-            session["findings_data"] = {
-                "findings": findings_list,
-                "stats": {
-                    "HIGH": scout_summary.get("HIGH", 0),
-                    "MED": scout_summary.get("MED", 0),
-                    "LOW": scout_summary.get("LOW", 0),
-                    "total": scout_summary.get("total", 0),
-                    "auto_fixed": fixer_stats.get("fixed", 0),
-                    "flagged": fixer_stats.get("flagged", 0),
-                    "escalated": fixer_stats.get("escalated", 0)
-                }
-            }
-        except Exception as e:
-            logger.error(f"Findings assembly error: {e}")
-
-        session["status"] = "complete"
-        yield _sse_event({"agent": "pipeline", "status": "complete"})
-
-    return EventSourceResponse(pipeline_generator())
+    return app
 
 
-@app.get("/findings")
-async def get_findings():
-    """Return ranker+fixer output as JSON for findings table."""
-    if session["findings_data"] is None:
-        raise HTTPException(status_code=425, detail="Audit not complete yet")
-    return session["findings_data"]
-
-
-@app.get("/download-narrative")
-async def download_narrative():
-    """Return audit narrative as downloadable PDF."""
-    if session["narrative_pdf"] is None:
-        raise HTTPException(status_code=425, detail="PDF not ready yet")
-    date_str = date.today().strftime("%Y%m%d")
-    return Response(
-        content=session["narrative_pdf"],
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="AuditGuard_Narrative_{date_str}.pdf"'
-        }
-    )
-
-
-@app.get("/status")
-async def get_status():
-    return {
-        "status": session["status"],
-        "agent_statuses": session["agent_statuses"]
-    }
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "AuditGuard AI"}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+app = create_app()

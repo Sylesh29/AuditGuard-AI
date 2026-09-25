@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"  # weekly deep property-based run
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - run: pip install -r backend/requirements-dev.txt
+      - run: ruff check backend
+      - run: node --check frontend/app.js
+      - name: Tests (thousands of generated datasets on the weekly run)
+        env:
+          HYPOTHESIS_PROFILE: ${{ github.event_name == 'schedule' && 'thorough' || 'ci' }}
+        run: pytest -q --cov=backend --cov-fail-under=95
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t auditguard .
+      - name: Smoke test the image
+        run: |
+          docker run -d --name ag -p 8000:8000 auditguard
+          for i in $(seq 1 30); do curl -sf localhost:8000/api/health && break; sleep 1; done
+          run_id=$(curl -sf -F file=@data/sample.csv localhost:8000/api/runs | python3 -c 'import sys,json;print(json.load(sys.stdin)["run_id"])')
+          # SSE frames end with a blank line, so match the run event anywhere in the stream.
+          curl -sfN localhost:8000/api/runs/$run_id/events | grep -q '"type":"run","status":"complete"'
+          curl -sf localhost:8000/api/runs/$run_id/report.pdf -o report.pdf && head -c 4 report.pdf | grep -q '%PDF'

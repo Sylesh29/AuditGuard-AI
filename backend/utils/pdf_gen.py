@@ -1,311 +1,221 @@
-﻿"""Convert narrator markdown output to a professional PDF using reportlab."""
+"""Render a Report as a PDF. Every string is XML-escaped before it reaches reportlab."""
+from __future__ import annotations
+
 import io
-import re
+from xml.sax.saxutils import escape
+
+from reportlab.lib.colors import HexColor, white
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.colors import HexColor, black, white
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-)
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.platypus import (
+    HRFlowable,
+    KeepTogether,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
-BLUE = HexColor('#185FA5')
-BLUE_DARK = HexColor('#0C447C')
-BLUE_LIGHT = HexColor('#E6F1FB')
-RED = HexColor('#C0392B')
-RED_LIGHT = HexColor('#FDEDEC')
-AMBER = HexColor('#E67E22')
-AMBER_LIGHT = HexColor('#FEF9E7')
-GREEN = HexColor('#27AE60')
-GREEN_LIGHT = HexColor('#EAFAF1')
-GRAY = HexColor('#7F8C8D')
-LIGHT_GRAY = HexColor('#F8F9FA')
-TEXT = HexColor('#2C3E50')
-BORDER = HexColor('#E0E0E0')
+from agents.narrator import Report
+
+BLUE = HexColor("#185FA5")
+BLUE_LIGHT = HexColor("#E6F1FB")
+RED = HexColor("#C0392B")
+RED_LIGHT = HexColor("#FDEDEC")
+AMBER = HexColor("#B9770E")
+AMBER_LIGHT = HexColor("#FEF9E7")
+GRAY = HexColor("#7F8C8D")
+LIGHT_GRAY = HexColor("#F8F9FA")
+TEXT = HexColor("#2C3E50")
+BORDER = HexColor("#E0E0E0")
+
+SEVERITY_WORD = {"HIGH": "Critical", "MED": "Moderate", "LOW": "Minor"}
+SEVERITY_COLORS = {"HIGH": (RED, RED_LIGHT), "MED": (AMBER, AMBER_LIGHT), "LOW": (GRAY, LIGHT_GRAY)}
+ACTION_WORD = {"corrected": "Correction proposed", "flagged": "Flagged",
+               "escalated": "Escalated", "none": "None"}
+
+STYLES = {
+    "title": ParagraphStyle("title", fontName="Helvetica-Bold", fontSize=18, textColor=BLUE,
+                            leading=22, spaceAfter=6),
+    "meta": ParagraphStyle("meta", fontName="Helvetica", fontSize=9, textColor=TEXT, leading=13),
+    "h2": ParagraphStyle("h2", fontName="Helvetica-Bold", fontSize=13, textColor=BLUE,
+                         spaceBefore=12, spaceAfter=6, leading=16),
+    "body": ParagraphStyle("body", fontName="Helvetica", fontSize=10, textColor=TEXT,
+                           leading=14, spaceAfter=4),
+    "bullet": ParagraphStyle("bullet", fontName="Helvetica", fontSize=10, textColor=TEXT,
+                             leading=14, leftIndent=14, bulletIndent=2, spaceAfter=4),
+    "cell": ParagraphStyle("cell", fontName="Helvetica", fontSize=8, textColor=TEXT, leading=10),
+    "head": ParagraphStyle("head", fontName="Helvetica-Bold", fontSize=8, textColor=white,
+                           leading=10),
+    "small": ParagraphStyle("small", fontName="Helvetica-Oblique", fontSize=8, textColor=GRAY,
+                            leading=11),
+}
 
 
-def _build_styles():
-    styles = getSampleStyleSheet()
-    custom = {}
+def _p(text: object, style: str = "body") -> Paragraph:
+    return Paragraph(escape(str(text)), STYLES[style])
 
-    custom['title'] = ParagraphStyle(
-        'DocTitle',
-        fontName='Helvetica-Bold',
-        fontSize=18,
-        textColor=BLUE,
-        spaceAfter=4,
-        leading=22
+
+def _labelled(label: str, value: object) -> Paragraph:
+    return Paragraph(f"<b>{escape(label)}:</b> {escape(str(value))}", STYLES["meta"])
+
+
+def _heading(text: str) -> list:
+    return [Spacer(1, 4), HRFlowable(width="100%", thickness=1, color=BLUE_LIGHT), _p(text, "h2")]
+
+
+def _footer(reference_id: str):
+    def draw(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(GRAY)
+        canvas.drawString(0.75 * inch, 0.4 * inch, f"AuditGuard AI | {reference_id} | Confidential")
+        canvas.drawRightString(letter[0] - 0.75 * inch, 0.4 * inch, f"Page {doc.page}")
+        canvas.restoreState()
+    return draw
+
+
+def _findings_table(findings: list[dict], width: float) -> Table:
+    widths = [0.45, 0.55, 1.15, 0.7, 0.5, 0.95]
+    widths.append(width / inch - sum(widths))
+    header = ["Rank", "ID", "Issue", "Severity", "Rows", "Action", "Why it matters"]
+    rows = [[_p(h, "head") for h in header]]
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), BLUE),
+        ("GRID", (0, 0), (-1, -1), 0.5, BORDER),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+    for i, f in enumerate(findings, start=1):
+        rows.append([
+            _p(f["rank"], "cell"), _p(f["finding_id"], "cell"), _p(f["issue"], "cell"),
+            _p(SEVERITY_WORD[f["severity"]], "cell"), _p(f["rows"], "cell"),
+            _p(ACTION_WORD[f["action"]], "cell"), _p(f["reason"], "cell"),
+        ])
+        fg, bg = SEVERITY_COLORS[f["severity"]]
+        style.append(("BACKGROUND", (0, i), (-1, i), LIGHT_GRAY if i % 2 == 0 else white))
+        style.append(("BACKGROUND", (3, i), (3, i), bg))
+        style.append(("TEXTCOLOR", (3, i), (3, i), fg))
+    table = Table(rows, colWidths=[w * inch for w in widths], repeatRows=1)
+    table.setStyle(TableStyle(style))
+    return table
+
+
+def _signature_block(width: float) -> Table:
+    table = Table(
+        [["Signed: ____________________________", "Title: ____________________________"],
+         ["Date: _____________________________", "Facility: _________________________"]],
+        colWidths=[width / 2, width / 2],
     )
-    custom['subtitle'] = ParagraphStyle(
-        'DocSubtitle',
-        fontName='Helvetica',
-        fontSize=10,
-        textColor=GRAY,
-        spaceAfter=2
-    )
-    custom['h2'] = ParagraphStyle(
-        'H2',
-        fontName='Helvetica-Bold',
-        fontSize=13,
-        textColor=BLUE,
-        spaceBefore=14,
-        spaceAfter=6,
-        leading=16
-    )
-    custom['body'] = ParagraphStyle(
-        'Body',
-        fontName='Helvetica',
-        fontSize=10,
-        textColor=TEXT,
-        leading=14,
-        spaceAfter=4
-    )
-    custom['bullet'] = ParagraphStyle(
-        'Bullet',
-        fontName='Helvetica',
-        fontSize=10,
-        textColor=TEXT,
-        leading=14,
-        leftIndent=16,
-        spaceAfter=3,
-        bulletIndent=4
-    )
-    custom['cert'] = ParagraphStyle(
-        'Cert',
-        fontName='Helvetica',
-        fontSize=10,
-        textColor=TEXT,
-        leading=16,
-        spaceAfter=4
-    )
-    custom['mono'] = ParagraphStyle(
-        'Mono',
-        fontName='Courier',
-        fontSize=9,
-        textColor=TEXT,
-        leading=12
-    )
-    return custom
+    table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("TEXTCOLOR", (0, 0), (-1, -1), TEXT),
+        ("TOPPADDING", (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ("BOX", (0, 0), (-1, -1), 0.5, BORDER),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER),
+        ("BACKGROUND", (0, 0), (-1, -1), LIGHT_GRAY),
+    ]))
+    return table
 
 
-def _severity_color(severity: str):
-    s = severity.upper()
-    if s == "HIGH" or s == "CRITICAL":
-        return RED, RED_LIGHT
-    elif s == "MED" or s == "MODERATE":
-        return AMBER, AMBER_LIGHT
-    else:
-        return GRAY, LIGHT_GRAY
+PDF_MAX_FINDINGS = 1000  # beyond this, the table points to findings.csv (never silently)
 
 
-def _parse_table(lines: list[str]) -> list[list[str]]:
-    rows = []
-    for line in lines:
-        if line.strip().startswith('|') and not re.match(r'\|[-| ]+\|', line.strip()):
-            cells = [c.strip() for c in line.strip().strip('|').split('|')]
-            rows.append(cells)
-    return rows
+def _bullets(items: list[str]) -> list:
+    return [Paragraph(item, STYLES["bullet"], bulletText="•") for item in items] or [_p("None.")]
 
 
-def _bold(text: str) -> str:
-    """Convert **text** to <b>text</b> for reportlab."""
-    return re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-
-
-def _add_footer(canvas, doc):
-    canvas.saveState()
-    canvas.setFont('Helvetica', 8)
-    canvas.setFillColor(GRAY)
-    canvas.drawString(inch * 0.75, 0.4 * inch, "AuditGuard AI — Confidential Audit Document")
-    canvas.drawRightString(
-        letter[0] - inch * 0.75, 0.4 * inch,
-        f"Page {doc.page}"
-    )
-    canvas.restoreState()
-
-
-def markdown_to_pdf(markdown_text: str, filename: str = "audit_narrative.pdf") -> bytes:
+def render_pdf(report: Report) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
-        buf,
-        pagesize=letter,
-        rightMargin=inch * 0.75,
-        leftMargin=inch * 0.75,
-        topMargin=inch * 0.9,
-        bottomMargin=inch * 0.75,
-        title="AuditGuard AI — Data Integrity Correction Summary"
+        buf, pagesize=letter, leftMargin=0.75 * inch, rightMargin=0.75 * inch,
+        topMargin=0.8 * inch, bottomMargin=0.75 * inch,
+        title=f"Data Integrity Correction Summary {report.reference_id}", author="AuditGuard AI",
     )
-
-    styles = _build_styles()
-    story = []
-
-    # Header banner
-    header_data = [["AuditGuard AI  |  Data Integrity Correction Summary"]]
-    header_table = Table(header_data, colWidths=[doc.width])
-    header_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), BLUE),
-        ('TEXTCOLOR', (0, 0), (-1, -1), white),
-        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 14),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('TOPPADDING', (0, 0), (-1, -1), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
-    ]))
-    story.append(header_table)
-    story.append(Spacer(1, 12))
-
-    lines = markdown_text.split('\n')
-    i = 0
-    in_table = False
-    table_lines = []
-
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        # Section heading ##
-        if stripped.startswith('## '):
-            if in_table:
-                story.extend(_render_table(table_lines, styles, doc))
-                table_lines = []
-                in_table = False
-            heading_text = stripped[3:].strip()
-            story.append(Spacer(1, 4))
-            story.append(HRFlowable(width="100%", thickness=1, color=BLUE_LIGHT))
-            story.append(Paragraph(heading_text, styles['h2']))
-            i += 1
-            continue
-
-        # Top-level heading #
-        if stripped.startswith('# '):
-            text = stripped[2:].strip()
-            story.append(Paragraph(text, styles['title']))
-            i += 1
-            continue
-
-        # Bold metadata lines like **Dataset:** value
-        if stripped.startswith('**') and ':' in stripped:
-            story.append(Paragraph(_bold(stripped), styles['body']))
-            i += 1
-            continue
-
-        # Table row
-        if stripped.startswith('|'):
-            if not in_table:
-                in_table = True
-                table_lines = []
-            table_lines.append(line)
-            i += 1
-            continue
-        else:
-            if in_table:
-                story.extend(_render_table(table_lines, styles, doc))
-                table_lines = []
-                in_table = False
-
-        # Bullet point
-        if stripped.startswith('- ') or stripped.startswith('* '):
-            text = stripped[2:].strip()
-            story.append(Paragraph(f"• {_bold(text)}", styles['bullet']))
-            i += 1
-            continue
-
-        # Certification block
-        if 'certify' in stripped.lower() or 'Signed:' in stripped or 'Date:' in stripped:
-            story.append(Paragraph(_bold(stripped), styles['cert']))
-            i += 1
-            continue
-
-        # Normal paragraph
-        if stripped:
-            story.append(Paragraph(_bold(stripped), styles['body']))
-
-        i += 1
-
-    if in_table:
-        story.extend(_render_table(table_lines, styles, doc))
-
-    # Signature block at end
-    story.append(Spacer(1, 20))
-    sig_data = [
-        ["Signed: _________________________ ", "Title: _________________________"],
-        ["Date: __________________________", "Facility: ______________________"]
+    s = report.stats
+    story: list = [
+        _p("Data Integrity Correction Summary", "title"),
+        _labelled("Reference ID", report.reference_id),
+        _labelled("Dataset", report.dataset_name),
+        _labelled("Source file SHA-256", report.source_sha256),
+        _labelled("Generated", report.generated_at.strftime("%B %d, %Y %H:%M UTC")),
+        _labelled("Records scanned", report.rows_scanned),
+        Spacer(1, 6),
     ]
-    sig_table = Table(sig_data, colWidths=[doc.width / 2, doc.width / 2])
-    sig_table.setStyle(TableStyle([
-        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('TEXTCOLOR', (0, 0), (-1, -1), TEXT),
-        ('TOPPADDING', (0, 0), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-        ('BOX', (0, 0), (-1, -1), 0.5, BORDER),
-        ('INNERGRID', (0, 0), (-1, -1), 0.5, BORDER),
-        ('BACKGROUND', (0, 0), (-1, -1), LIGHT_GRAY),
+
+    story += _heading("Executive Summary")
+    story.append(_p(report.executive_summary))
+    story.append(_p(
+        f"Findings: {s['total']} ({s['HIGH']} critical, {s['MED']} moderate, {s['LOW']} minor). "
+        f"Actions: {s['corrected']} corrections proposed, {s['escalated']} escalated, "
+        f"{s['flagged']} flagged. Change-log entries: {report.change_log_entries}."))
+
+    story += _heading(f"Findings and Actions ({len(report.findings)})")
+    if not report.findings:
+        story.append(_p("No findings."))
+    else:
+        shown = report.findings[:PDF_MAX_FINDINGS]
+        story.append(_findings_table(shown, doc.width))
+        if len(report.findings) > len(shown):
+            story.append(_p(
+                f"This table shows the {len(shown)} highest-ranked of {len(report.findings)} "
+                "findings. All findings, with the same IDs and ranks, are listed in findings.csv, "
+                f"which is part of this report package ({report.reference_id}).", "small"))
+
+    story += _heading(f"Open Items Requiring Human Sign-Off ({len(report.open_items)})")
+    story += _bullets([
+        f"<b>{escape(i['finding_id'])}</b> ({escape(i['action'])}, lot "
+        f"{escape(', '.join(i['lots']))}, {escape(i['issue'])}): {escape(i['instruction'])}"
+        for i in report.open_items[:PDF_MAX_FINDINGS]])
+    if len(report.open_items) > PDF_MAX_FINDINGS:
+        story.append(_p(f"{len(report.open_items) - PDF_MAX_FINDINGS} more open items are "
+                        "listed in findings.csv.", "small"))
+
+    story += _heading(f"Proposed Corrections ({len(report.corrections)})")
+    story += _bullets([
+        f"<b>{escape(c['finding_id'])}</b> (lot {escape(', '.join(c['lots']))}): "
+        f"{escape(c['description'])} {escape(c['reason'])}"
+        for c in report.corrections[:PDF_MAX_FINDINGS]])
+    if len(report.corrections) > PDF_MAX_FINDINGS:
+        story.append(_p(f"{len(report.corrections) - PDF_MAX_FINDINGS} more corrections are "
+                        "listed in findings.csv and changelog.csv.", "small"))
+    story.append(_p(
+        "The uploaded source file was not modified. Each proposed change, with its original "
+        "value, is listed in the change log (changelog.csv) issued with this report.", "small"))
+
+    if report.review_suggestions:
+        story += _heading(f"Advisory Ranking Suggestions ({len(report.review_suggestions)})")
+        story.append(_p("A second-opinion review suggested these rank changes. The ranking above "
+                        "was not changed; consider them when prioritising work.", "small"))
+        story += _bullets([
+            f"<b>{escape(x['finding_id'])}</b>: rank {x['rank']} to {x['suggested_rank']}. "
+            f"{escape(x['reason'])}" for x in report.review_suggestions])
+
+    story += _heading("Scope and Configuration")
+    if report.skipped_checks:
+        story.append(_p("Checks that could not run on this file:"))
+        story += _bullets([escape(c) for c in report.skipped_checks])
+    if report.notes:
+        story.append(_p("About the uploaded file:"))
+        story += _bullets([escape(n) for n in report.notes])
+    story += [_labelled(k, v) for k, v in report.configuration.items()]
+    story.append(Spacer(1, 4))
+    story.append(_p(report.disclaimer, "small"))
+    if report.summary_source == "template":
+        story.append(_p("The executive summary was generated from a fixed template.", "small"))
+
+    story.append(KeepTogether([
+        *_heading("Certification"),
+        _p(report.certification),
+        Spacer(1, 10),
+        _signature_block(doc.width),
     ]))
-    story.append(sig_table)
 
-    doc.build(story, onFirstPage=_add_footer, onLaterPages=_add_footer)
+    footer = _footer(report.reference_id)
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
     return buf.getvalue()
-
-
-def _render_table(table_lines: list[str], styles: dict, doc) -> list:
-    rows = _parse_table(table_lines)
-    if not rows:
-        return []
-
-    story_items = []
-    col_count = len(rows[0]) if rows else 1
-    col_width = doc.width / col_count
-
-    table_data = []
-    for row_idx, row in enumerate(rows):
-        # Pad/trim to col_count
-        while len(row) < col_count:
-            row.append("")
-        row = row[:col_count]
-        if row_idx == 0:
-            # Header row
-            table_data.append([Paragraph(f"<b>{c}</b>", styles['body']) for c in row])
-        else:
-            table_data.append([Paragraph(_bold(c), styles['body']) for c in row])
-
-    if not table_data:
-        return []
-
-    t = Table(table_data, colWidths=[col_width] * col_count, repeatRows=1)
-    ts = TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), BLUE),
-        ('TEXTCOLOR', (0, 0), (-1, 0), white),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 9),
-        ('GRID', (0, 0), (-1, -1), 0.5, BORDER),
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('TOPPADDING', (0, 0), (-1, -1), 5),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-        ('LEFTPADDING', (0, 0), (-1, -1), 5),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 5),
-    ])
-    # Alternating row colors
-    for row_idx in range(1, len(table_data)):
-        bg = LIGHT_GRAY if row_idx % 2 == 0 else white
-        ts.add('BACKGROUND', (0, row_idx), (-1, row_idx), bg)
-
-        # Color severity column if present (usually col index 2)
-        row = rows[row_idx]
-        for col_idx, cell in enumerate(row):
-            cell_upper = cell.upper()
-            if cell_upper in ("HIGH", "CRITICAL"):
-                ts.add('BACKGROUND', (col_idx, row_idx), (col_idx, row_idx), RED_LIGHT)
-                ts.add('TEXTCOLOR', (col_idx, row_idx), (col_idx, row_idx), RED)
-            elif cell_upper in ("MED", "MODERATE", "MEDIUM"):
-                ts.add('BACKGROUND', (col_idx, row_idx), (col_idx, row_idx), AMBER_LIGHT)
-                ts.add('TEXTCOLOR', (col_idx, row_idx), (col_idx, row_idx), AMBER)
-            elif cell_upper in ("LOW", "MINOR"):
-                ts.add('BACKGROUND', (col_idx, row_idx), (col_idx, row_idx), LIGHT_GRAY)
-
-    t.setStyle(ts)
-    story_items.append(t)
-    story_items.append(Spacer(1, 8))
-    return story_items

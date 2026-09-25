@@ -1,4 +1,4 @@
-﻿# AuditGuard AI — Product Brief
+# AuditGuard AI — Product Brief
 
 **Track:** 01 — Data Rescue
 **Team:** Solo builder
@@ -26,10 +26,10 @@ A compliance officer with zero technical skills uploads a CSV, clicks one button
 
 ## How it works
 
-1. **Scout** - Detects all data quality issues and enriches with FDA regulatory context using Claude AI.
-2. **Ranker** - Prioritizes findings by audit risk with deterministic rules and Claude review.
-3. **Fixer** - Auto-fixes what it can, flags and escalates the rest. Every action logged with reason.
-4. **Narrator** - Generates a complete plain-English audit narrative PDF ready for signature.
+1. **Scout** - Detects data-integrity issues with deterministic rules and attaches a reviewed regulatory reference to each.
+2. **Ranker** - Prioritizes findings by audit risk with deterministic rules; Claude gives an advisory second opinion.
+3. **Fixer** - Proposes safe corrections in a separate copy (the source is never modified), flags and escalates the rest. Every change logged with old value, new value and reason.
+4. **Narrator** - Builds the report from the data (every finding included); Claude writes only the validated executive summary.
 
 ---
 
@@ -45,8 +45,8 @@ A compliance officer with zero technical skills uploads a CSV, clicks one button
 
 | Criterion | How AuditGuard AI satisfies it |
 |-----------|-------------------------------|
-| Data rescue demonstrated | 4 issue types detected, 3 action types taken with logged reasons |
-| Multi-agent architecture | 4 agents with real Cognee memory handoffs |
+| Data rescue demonstrated | 7 issue types detected, 3 action types taken with logged reasons |
+| Multi-agent architecture | 4 specialised stages handing off through a per-run shared blackboard |
 | Explainability | Every ranking and fixing decision has a specific plain-English reason |
 | Non-technical usability | Zero-jargon UI, drag-and-drop upload, PDF output ready to sign |
-| Regulatory relevance | FDA 21 CFR Part 11 and ISO 13485 references embedded in findings |
+| Regulatory relevance | ISO 13485:2016 clause and ALCOA+ references per finding; source records never altered (21 CFR 11.10(e) principle) |

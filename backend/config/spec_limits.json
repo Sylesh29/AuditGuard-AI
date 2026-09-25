@@ -1,0 +1,28 @@
+{
+  "_comment": "Example process specification. These are NOT regulatory limits: acceptance criteria come from each manufacturer's own validated process specs. Replace these values with your product specifications before real use.",
+  "pass_statuses": [
+    "PASS"
+  ],
+  "fail_statuses": [
+    "FAIL"
+  ],
+  "default": {
+    "temperature_c": {
+      "min": 20.0,
+      "max": 85.0
+    }
+  },
+  "products": {},
+  "outlier_robust_z": 3.5,
+  "units": {
+    "column": "unit",
+    "quantity_column": "quantity",
+    "canonical": "kg",
+    "to_canonical": {
+      "kg": 1.0,
+      "g": 0.001,
+      "lb": 0.45359237,
+      "lbs": 0.45359237
+    }
+  }
+}
