@@ -1,8 +1,9 @@
 __pycache__/
 *.py[cod]
 .env
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
 *.db
 *.log
-*.err.log
-*.out.log
-server_*.log

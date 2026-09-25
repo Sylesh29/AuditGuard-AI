@@ -1,194 +1,177 @@
-﻿"""Agent 3 -- Fixer: Reads ranked findings, takes action, logs every decision."""
+"""Stage 3, Fixer: proposes corrections without ever touching the source records.
+
+Design rules (21 CFR 11.10(e): changes must not obscure previously recorded information):
+  * The uploaded data is read-only. Corrections go into a separate *proposed* copy.
+  * Every proposed change is a ChangeLogEntry with old value, new value, rule and reason.
+  * Flags accumulate per row in rank order. A lower-priority flag never replaces a higher one.
+  * Anything whose true value is unknown is escalated or flagged, never guessed.
+"""
+from __future__ import annotations
+
+import json
+from collections import defaultdict
+
 import pandas as pd
-import logging
-from anthropic import AsyncAnthropic
-from memory.cognee_store import read_memory, write_memory
 
-logger = logging.getLogger(__name__)
-client = AsyncAnthropic()
+from models import Action, ChangeLogEntry, FixerResult, RankedFinding, RowFlag
+from settings import SpecLimits
 
-
-async def _claude_summary(finding_summary: str) -> str:
-    try:
-        msg = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=150,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"In one sentence, explain to a compliance officer (not a data engineer) "
-                    f"the correction action taken for this finding: {finding_summary}"
-                )
-            }]
-        )
-        return msg.content[0].text.strip()
-    except Exception as e:
-        logger.warning(f"Fixer Claude summary failed: {e}")
-        return ""
+FLAG_COLUMN = "audit_flags"
+FLAG_SEPARATOR = " | "
 
 
-async def run_fixer(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    ranker_data = await read_memory("ranker")
-    if not ranker_data:
-        logger.error("Fixer: no ranker data in memory")
-        return df, {"auto_fixed": [], "flagged": [], "escalated": [], "stats": {}}
+def _text(value: object) -> str | None:
+    return None if pd.isna(value) else str(value)
 
-    ranked = ranker_data.get("ranked_findings", [])
-    df_fixed = df.copy()
 
-    if "audit_flag" not in df_fixed.columns:
-        df_fixed["audit_flag"] = ""
+def _format_quantity(value: float) -> str:
+    return f"{value:.3f}".rstrip("0").rstrip(".")
 
-    auto_fixed = []
-    flagged = []
-    escalated = []
 
-    for item in ranked:
-        f = item.get("original_finding", item)
-        itype = f.get("issue_type", "")
-        row_ids = f.get("row_ids", [])
-        raw = f.get("raw_values", {})
-        lots = f.get("lot_numbers", [])
-        lot_str = ", ".join(str(l) for l in lots[:3])
+class _Fixer:
+    def __init__(self, source: pd.DataFrame, spec: SpecLimits) -> None:
+        self.spec = spec
+        self.corrected = source.copy(deep=True)
+        self.actions: list[Action] = []
+        self.changes: list[ChangeLogEntry] = []
+        self.flags: list[RowFlag] = []
+        self.replaced_by: dict[int, int] = {}  # removed duplicate row -> kept row
 
-        if itype == "exact_duplicate":
-            # Keep most recent batch_date, remove others
-            valid_ids = [i for i in row_ids if i in df_fixed.index]
-            if valid_ids:
-                sub = df_fixed.loc[valid_ids].copy()
-                sub["_bd"] = pd.to_datetime(sub["batch_date"], errors="coerce")
-                keep_idx = sub["_bd"].idxmax() if not sub["_bd"].isna().all() else valid_ids[0]
-                remove_ids = [i for i in valid_ids if i != keep_idx]
-                df_fixed = df_fixed.drop(index=remove_ids)
-                reason = (
-                    "Kept the most recent batch record per ISO 13485 §4.2.4 document control. "
-                    f"Removed {len(remove_ids)} exact duplicate row(s)."
-                )
-                summary_text = await _claude_summary(
-                    f"Removed {len(remove_ids)} duplicate rows for lot {lot_str}, "
-                    f"kept row {keep_idx} with most recent batch_date"
-                )
-                auto_fixed.append({
-                    "finding_id": f.get("finding_id"),
-                    "action_taken": f"Removed rows {remove_ids}, kept row {keep_idx}",
-                    "reason": reason,
-                    "rows_affected": len(remove_ids),
-                    "claude_summary": summary_text
-                })
+    def _lot(self, row_id: int) -> str:
+        return _text(self.corrected.at[row_id, "lot_number"]) or ""
 
-        elif itype == "missing_timestamp":
-            valid_ids = [i for i in row_ids if i in df_fixed.index]
-            if valid_ids:
-                df_fixed.loc[valid_ids, "batch_date"] = "REQUIRES_MANUAL_ENTRY"
-                reason = (
-                    "Flagged missing batch_date fields with 'REQUIRES_MANUAL_ENTRY'. "
-                    "Missing timestamps are an audit traceability violation per FDA 21 CFR Part 11."
-                )
-                summary_text = await _claude_summary(
-                    f"{len(valid_ids)} rows for lots {lot_str} had no batch_date — "
-                    "filled with REQUIRES_MANUAL_ENTRY placeholder"
-                )
-                auto_fixed.append({
-                    "finding_id": f.get("finding_id"),
-                    "action_taken": f"Set batch_date to 'REQUIRES_MANUAL_ENTRY' for {len(valid_ids)} row(s)",
-                    "reason": reason,
-                    "rows_affected": len(valid_ids),
-                    "claude_summary": summary_text
-                })
+    def _live(self, row_ids: list[int]) -> list[int]:
+        """Map removed duplicates onto the kept copy so their flags are not lost."""
+        return sorted({self.replaced_by.get(r, r) for r in row_ids})
 
-        elif itype == "unit_conflict":
-            valid_ids = [i for i in row_ids if i in df_fixed.index]
-            if valid_ids:
-                units = raw.get("units_found", [])
-                flag_text = (
-                    f"UNIT_CONFLICT: lot {lot_str} appears as both "
-                    f"{' and '.join(units)} — verify canonical unit with production "
-                    "engineer before submission."
-                )
-                df_fixed.loc[valid_ids, "audit_flag"] = flag_text
-                flagged.append({
-                    "finding_id": f.get("finding_id"),
-                    "flag_text": flag_text,
-                    "reason": (
-                        f"Unit conflict in lot {lot_str} prevents quantity verification. "
-                        "Data unchanged pending engineer confirmation of canonical unit."
-                    ),
-                    "rows_affected": len(valid_ids)
-                })
+    def flag(self, finding: RankedFinding, text: str, row_ids: list[int] | None = None) -> list[int]:
+        rows = self._live(row_ids if row_ids is not None else finding.row_ids)
+        for row_id in rows:
+            self.flags.append(RowFlag(row_id=row_id, finding_id=finding.finding_id,
+                                      rank=finding.rank, text=text))
+        return rows
 
-        elif itype == "statistical_outlier":
-            valid_ids = [i for i in row_ids if i in df_fixed.index]
-            if valid_ids:
-                col = raw.get("column", "value")
-                val = raw.get("value", "?")
-                n_std = raw.get("n_std", "?")
-                flag_text = (
-                    f"OUTLIER_REVIEW: {col} value {val} is {n_std}σ from mean — "
-                    "verify sensor reading or document process excursion."
-                )
-                df_fixed.loc[valid_ids, "audit_flag"] = flag_text
-                flagged.append({
-                    "finding_id": f.get("finding_id"),
-                    "flag_text": flag_text,
-                    "reason": (
-                        f"Statistical outlier in {col} for lot {lot_str}. "
-                        "Data unchanged — requires engineer or QC sign-off."
-                    ),
-                    "rows_affected": len(valid_ids)
-                })
+    def change(self, finding: RankedFinding, row_id: int, field: str, new: str | None,
+               rule: str, reason: str) -> None:
+        old = _text(self.corrected.at[row_id, field])
+        self.changes.append(ChangeLogEntry(
+            row_id=row_id, lot_number=self._lot(row_id), field=field, old_value=old,
+            new_value=new, finding_id=finding.finding_id, rule=rule, reason=reason))
+        self.corrected.at[row_id, field] = new
 
-        elif itype == "compliance_contradiction":
-            valid_ids = [i for i in row_ids if i in df_fixed.index]
-            if valid_ids:
-                temp = raw.get("temperature_c", "?")
-                flag_text = (
-                    f"CRITICAL_ESCALATION: Lot {lot_str} marked PASS with temperature "
-                    f"{temp}°C — exceeds FDA threshold of 85°C. "
-                    "Do NOT submit without engineer sign-off."
-                )
-                df_fixed.loc[valid_ids, "audit_flag"] = flag_text
-                escalated.append({
-                    "finding_id": f.get("finding_id"),
-                    "escalation_text": flag_text,
-                    "reason": (
-                        f"Compliance contradiction for lot {lot_str}: temperature {temp}°C "
-                        "with PASS status is a direct FDA violation. Escalated for human review."
-                    ),
-                    "rows_affected": len(valid_ids)
-                })
+    def act(self, finding: RankedFinding, action: str, description: str, reason: str,
+            rows: int) -> None:
+        self.actions.append(Action(finding_id=finding.finding_id, action=action,
+                                   description=description, reason=reason, rows_affected=rows))
 
-        elif itype == "near_duplicate_lot":
-            valid_ids = [i for i in row_ids if i in df_fixed.index]
-            if valid_ids:
-                qtys = raw.get("quantities", [])
-                flag_text = (
-                    f"LOT_CONFLICT: Lot {lot_str} has {len(qtys)} records with differing "
-                    f"quantities ({', '.join(str(q) for q in qtys)}) — physical inventory "
-                    "verification required."
-                )
-                df_fixed.loc[valid_ids, "audit_flag"] = flag_text
-                escalated.append({
-                    "finding_id": f.get("finding_id"),
-                    "escalation_text": flag_text,
-                    "reason": (
-                        f"Near-duplicate lot {lot_str} with conflicting quantities. "
-                        "Cannot auto-resolve — physical count required before submission."
-                    ),
-                    "rows_affected": len(valid_ids)
-                })
+    # --- handlers, one per issue type ---------------------------------------------------
 
-    action_log = {
-        "auto_fixed": auto_fixed,
-        "flagged": flagged,
-        "escalated": escalated,
-        "stats": {
-            "fixed": len(auto_fixed),
-            "flagged": len(flagged),
-            "escalated": len(escalated),
-            "total_actions": len(auto_fixed) + len(flagged) + len(escalated)
-        }
-    }
+    def exact_duplicate(self, f: RankedFinding) -> None:
+        keep, *remove = sorted(f.row_ids)
+        for row_id in remove:
+            record = {k: _text(v) for k, v in self.corrected.loc[row_id].items()}
+            self.changes.append(ChangeLogEntry(
+                row_id=row_id, lot_number=self._lot(row_id), field="(entire row)",
+                old_value=json.dumps(record), new_value=None, finding_id=f.finding_id,
+                rule="remove_exact_duplicate",
+                reason=f"Identical copy of row {keep}; the original row is kept unchanged."))
+            self.replaced_by[row_id] = keep
+        self.corrected = self.corrected.drop(index=remove)
+        self.flag(f, f"DUPLICATE_REMOVED: {len(remove)} identical cop"
+                     f"{'y' if len(remove) == 1 else 'ies'} removed ({f.finding_id})", [keep])
+        self.act(f, "corrected", f"Proposed removal of {len(remove)} identical copy/copies; "
+                 f"row {keep} kept.",
+                 "Every column is identical, so no information is lost by keeping one copy. "
+                 "The removed rows are preserved in the change log.", len(remove))
 
-    await write_memory("fixer", action_log)
-    logger.info(f"Fixer complete: {action_log['stats']}")
-    return df_fixed, action_log
+    def unit_conflict(self, f: RankedFinding) -> None:
+        units = self.spec.units
+        converted = []
+        for row_id in self._live(f.row_ids):
+            factor = units.factor(self.corrected.at[row_id, units.column])
+            unit = _text(self.corrected.at[row_id, units.column])
+            quantity = pd.to_numeric(self.corrected.at[row_id, units.quantity_column],
+                                     errors="coerce")
+            if factor is None or pd.isna(quantity) or unit.strip().lower() == units.canonical:
+                continue
+            new_qty = _format_quantity(float(quantity) * factor)
+            reason = f"Converted {quantity:g} {unit} to {units.canonical} (x{factor:g})."
+            self.change(f, row_id, units.quantity_column, new_qty, "normalise_unit", reason)
+            self.change(f, row_id, units.column, units.canonical, "normalise_unit", reason)
+            converted.append(row_id)
+
+        if converted and f.details.get("agree_after_conversion"):
+            self.flag(f, f"UNIT_NORMALISED: converted to {units.canonical}; confirm with "
+                         f"production engineer ({f.finding_id})")
+            self.act(f, "corrected",
+                     f"Proposed conversion of {len(converted)} row(s) to {units.canonical}.",
+                     "After conversion the records agree, so the conversion is safe to propose. "
+                     "An engineer must confirm the canonical unit.", len(converted))
+        else:
+            self.flag(f, f"UNIT_CONFLICT: quantities disagree even after conversion "
+                         f"({f.finding_id})")
+            self.act(f, "flagged", "Flagged; quantity left unchanged.",
+                     "The quantities do not reconcile after conversion, so the true batch "
+                     "weight is unknown.", len(f.row_ids))
+
+    def compliance_contradiction(self, f: RankedFinding) -> None:
+        violations = "; ".join(f"{v['parameter']}={v['value']:g} (spec {v['spec']})"
+                               for v in f.details.get("violations", []))
+        rows = self.flag(f, f"CRITICAL: marked {f.details.get('status', 'PASS')} but "
+                            f"{violations}. Do not submit without QA sign-off ({f.finding_id})")
+        self.act(f, "escalated", "Escalated for QA sign-off. Status left unchanged.",
+                 "Only a person with the batch record can decide whether the status or the "
+                 "measurement is wrong.", len(rows))
+
+    def lot_conflict(self, f: RankedFinding) -> None:
+        fields = ", ".join(f.details.get("conflicting_fields", []))
+        rows = self.flag(f, f"LOT_CONFLICT: records disagree on {fields}; verify against the "
+                            f"batch record ({f.finding_id})")
+        self.act(f, "escalated", "Escalated. All versions kept.",
+                 "The data cannot say which version is true; a physical count or the batch "
+                 "record must decide.", len(rows))
+
+    def statistical_outlier(self, f: RankedFinding) -> None:
+        d = f.details
+        rows = self.flag(f, f"OUTLIER_REVIEW: {d.get('column')}={d.get('value'):g} is far "
+                            f"outside the normal range for {d.get('baseline')} ({f.finding_id})")
+        self.act(f, "flagged", "Flagged for review. Value left unchanged.",
+                 "An extreme value may be a sensor fault or a real process excursion; either "
+                 "way it needs a documented explanation.", len(rows))
+
+    def missing_timestamp(self, f: RankedFinding) -> None:
+        rows = self.flag(f, f"MISSING_BATCH_DATE: enter from the batch record ({f.finding_id})")
+        self.act(f, "flagged", "Flagged for manual entry. Field left empty.",
+                 "A production date cannot be inferred and must not be estimated.", len(rows))
+
+    def invalid_timestamp(self, f: RankedFinding) -> None:
+        rows = self.flag(f, f"INVALID_BATCH_DATE: '{f.details.get('value')}' "
+                            f"({f.details.get('problem')}) ({f.finding_id})")
+        self.act(f, "flagged", "Flagged for correction. Value left unchanged.",
+                 "The correct date must come from the batch record.", len(rows))
+
+
+def run_fixer(source: pd.DataFrame, ranked: list[RankedFinding], spec: SpecLimits
+              ) -> tuple[pd.DataFrame, FixerResult]:
+    fixer = _Fixer(source, spec)
+    # Resolve duplicates first so later flags on a removed copy land on the kept row.
+    for finding in sorted(ranked, key=lambda f: f.issue_type != "exact_duplicate"):
+        getattr(fixer, finding.issue_type)(finding)
+    fixer.actions.sort(key=lambda a: next(f.rank for f in ranked if f.finding_id == a.finding_id))
+
+    by_row: dict[int, list[RowFlag]] = defaultdict(list)
+    for flag in fixer.flags:
+        by_row[flag.row_id].append(flag)
+    corrected = fixer.corrected
+    corrected[FLAG_COLUMN] = [
+        FLAG_SEPARATOR.join(fl.text for fl in sorted(by_row.get(row_id, []), key=lambda x: x.rank))
+        for row_id in corrected.index
+    ]
+
+    return corrected, FixerResult(
+        actions=fixer.actions,
+        change_log=fixer.changes,
+        flags=sorted(fixer.flags, key=lambda fl: (fl.row_id, fl.rank)),
+        rows_in=len(source),
+        rows_out=len(corrected),
+    )
